@@ -2,10 +2,36 @@ import { Keypair, StrKey, MuxedAccount } from '@stellar/stellar-sdk'
 import { randomBytes } from 'crypto'
 import type { Pool } from 'pg'
 
+// Minimal structural subset of the Fastify/Pino logger — just what auth needs
+// to log through the request's logger instead of `console.*` (issue #132),
+// so `LOG_LEVEL` applies and log lines carry the request correlation id.
+export interface AuthLogger {
+  debug(msg: string): void
+  warn(msg: string): void
+  error(msg: string): void
+}
+
+// Typed error for nonce store capacity exceeded (issue #135)
+export class NonceStoreCapacityError extends Error {
+  constructor(message: string = 'Nonce store capacity exceeded') {
+    super(message)
+    this.name = 'NonceStoreCapacityError'
+  }
+}
+
 // Nonce storage interface - in production this would use Redis or similar
 export interface NonceStore {
-  issue(address: string): Promise<string>
+  issue(address: string, logger?: AuthLogger): Promise<string>
   consume(address: string, nonce: string): Promise<boolean>
+}
+
+// A member's address is their on-chain identity — logging it in full on every
+// request links identity to request timing (issue #133). Truncate the way a
+// block explorer does (first 4 / last 4 chars) so debug output stays useful
+// for eyeballing without writing the full address to disk on every request.
+function truncateAddress(address: string): string {
+  if (address.length <= 10) return address
+  return `${address.slice(0, 4)}…${address.slice(-4)}`
 }
 
 // In-memory nonce store for development
@@ -48,19 +74,37 @@ export class MemoryNonceStore implements NonceStore {
     }
   }
 
-  async issue(address: string): Promise<string> {
-    // Generate a random 32-byte nonce (64 hex chars)
-    const nonce = randomBytes(32).toString('hex')
+  async issue(address: string, logger?: AuthLogger): Promise<string> {
+    const now = Date.now()
+
+    // Check if we already have an unexpired nonce for this address
+    const existingEntry = this.store.get(address)
+    if (existingEntry) {
+      if (existingEntry.expiresAt > now) {
+        // Nonce is still valid - return existing one
+        // This prevents an attacker from invalidating a victim's nonce
+        // and also prevents self-invalidation from multiple tabs
+        logger?.debug(`[auth] Returning existing nonce for ${truncateAddress(address)}, expires in ${Math.floor((existingEntry.expiresAt - now) / 1000)}s`)
+        return existingEntry.nonce
+      } else {
+        // Nonce has expired, clean it up
+        this.store.delete(address)
+      }
+    }
     
     // If we're at capacity, reject new challenges to prevent DoS
     if (this.store.size >= this.MAX_ENTRIES) {
-      throw new Error('Nonce store capacity exceeded')
+      throw new NonceStoreCapacityError()
     }
+    
+    // Generate a random 32-byte nonce (64 hex chars)
+    const nonce = randomBytes(32).toString('hex')
     
     this.store.set(address, {
       nonce,
-      expiresAt: Date.now() + this.TTL_MS
+      expiresAt: now + this.TTL_MS
     })
+    
     return nonce
   }
 
@@ -84,9 +128,13 @@ export class PostgresNonceStore implements NonceStore {
   private pool: Pool
   private readonly TTL_MS = 5 * 60 * 1000 // 5 minutes
   private cleanupTimer: NodeJS.Timeout | null = null
+  // Background timer, not tied to any one request — falls back to this
+  // base logger (e.g. `app.log`) rather than the per-call logger `issue()` gets.
+  private readonly logger?: AuthLogger
 
-  constructor(pool: Pool) {
+  constructor(pool: Pool, logger?: AuthLogger) {
     this.pool = pool
+    this.logger = logger
     this.startCleanup()
   }
 
@@ -99,7 +147,7 @@ export class PostgresNonceStore implements NonceStore {
         )
       } catch (error) {
         // Log but don't throw - cleanup failure shouldn't crash the process
-        console.warn(`[auth] expired-nonce cleanup failed: ${(error as Error).message}`)
+        this.logger?.warn(`[auth] expired-nonce cleanup failed: ${(error as Error).message}`)
       }
     }, 10 * 60 * 1000) // Every 10 minutes
     // Unref the timer so it doesn't prevent graceful shutdown
@@ -115,11 +163,26 @@ export class PostgresNonceStore implements NonceStore {
     }
   }
 
-  async issue(address: string): Promise<string> {
-    const nonce = randomBytes(32).toString('hex')
-    const expiresAt = new Date(Date.now() + this.TTL_MS)
+  async issue(address: string, logger?: AuthLogger): Promise<string> {
+    // First, check if there's an existing unexpired nonce
+    const existingResult = await this.pool.query(
+      `SELECT nonce FROM auth_nonces
+       WHERE address = $1 AND expires_at > now()`,
+      [address]
+    )
 
-    // Insert the nonce. If an address already has a nonce, replace it (UPSERT via ON CONFLICT)
+    if (existingResult.rows.length > 0) {
+      // Nonce is still valid - return existing one
+      // This prevents an attacker from invalidating a victim's nonce
+      // and also prevents self-invalidation from multiple tabs
+      logger?.debug(`[auth] Returning existing nonce for ${truncateAddress(address)}`)
+      return existingResult.rows[0].nonce
+    }
+    
+    const expiresAt = new Date(Date.now() + this.TTL_MS)
+    const nonce = randomBytes(32).toString('hex')
+    
+    // Insert the nonce. If an address already has a nonce (but expired), replace it
     await this.pool.query(
       `INSERT INTO auth_nonces (address, nonce, expires_at) 
        VALUES ($1, $2, $3)
@@ -170,7 +233,8 @@ const ED25519_SIGNATURE_BYTES = 64
 export function verifySignature(
   address: string,
   nonce: string,
-  signature: string
+  signature: string,
+  logger?: AuthLogger
 ): SignatureResult {
   const type = classifyStellarAddress(address)
 
@@ -198,7 +262,7 @@ export function verifySignature(
     try {
       ed25519Address = MuxedAccount.fromAddress(address, '0').baseAccount().accountId()
     } catch (error) {
-      console.warn(`[auth] could not resolve muxed address ${address}: ${(error as Error).message}`)
+      logger?.warn(`[auth] could not resolve muxed address ${truncateAddress(address)}: ${(error as Error).message}`)
       return { ok: false, status: 400, error: 'Malformed muxed (M…) address' }
     }
   }
@@ -209,8 +273,8 @@ export function verifySignature(
   // encoding, logged distinctly from a valid-but-wrong signature.
   const signatureBuffer = Buffer.from(signature, 'base64')
   if (signatureBuffer.length !== ED25519_SIGNATURE_BYTES) {
-    console.warn(
-      `[auth] signature for ${address} decoded to ${signatureBuffer.length} bytes (expected ${ED25519_SIGNATURE_BYTES}) — malformed base64`
+    logger?.warn(
+      `[auth] signature for ${truncateAddress(address)} decoded to ${signatureBuffer.length} bytes (expected ${ED25519_SIGNATURE_BYTES}) — malformed base64`
     )
     return { ok: false, status: 401, error: 'Invalid signature' }
   }
@@ -219,12 +283,12 @@ export function verifySignature(
   try {
     const keypair = Keypair.fromPublicKey(ed25519Address)
     if (!keypair.verify(data, signatureBuffer)) {
-      console.warn(`[auth] signature verification failed for ${address} (well-formed, wrong signature or key)`)
+      logger?.warn(`[auth] signature verification failed for ${truncateAddress(address)} (well-formed, wrong signature or key)`)
       return { ok: false, status: 401, error: 'Invalid signature' }
     }
     return { ok: true, ed25519Address }
   } catch (error) {
-    console.warn(`[auth] unexpected error verifying signature for ${address}: ${(error as Error).message}`)
+    logger?.warn(`[auth] unexpected error verifying signature for ${truncateAddress(address)}: ${(error as Error).message}`)
     return { ok: false, status: 401, error: 'Invalid signature' }
   }
 }
@@ -278,7 +342,8 @@ export type AuthResult =
 export async function authenticateRequest(
   headers: Record<string, unknown>,
   nonceStore: NonceStore,
-  targetAddress?: string
+  targetAddress?: string,
+  logger?: AuthLogger
 ): Promise<AuthResult> {
   const { address, signature, nonce } = extractAuthHeaders(headers)
 
@@ -286,21 +351,26 @@ export async function authenticateRequest(
     return { authenticated: false, status: 401, error: 'Missing authentication headers' }
   }
 
-  // Check if the nonce is valid and hasn't been used
+  // Verify the signature first — consuming the nonce before this would let
+  // anyone who reads a victim's (non-secret, by design) challenge burn it
+  // with a garbage signature, denying the victim's real request (issue #115).
+  const sig = verifySignature(address, nonce, signature, logger)
+  if (!sig.ok) {
+    return { authenticated: false, status: sig.status, error: sig.error }
+  }
+
+  // Only now consume the nonce, so a bad signature never spends it.
   const nonceValid = await nonceStore.consume(address, nonce)
   if (!nonceValid) {
     return { authenticated: false, status: 401, error: 'Invalid or expired nonce' }
   }
 
-  // Verify the signature
-  const sig = verifySignature(address, nonce, signature)
-  if (!sig.ok) {
-    return { authenticated: false, status: sig.status, error: sig.error }
-  }
-
-  // If a target address is provided, ensure it matches the authenticated address
+  // If a target address is provided, ensure it matches the authenticated address.
+  // 403, not 401 — the caller *is* authenticated, they're just not authorized
+  // to act on another address, and this must match the ownership check in
+  // PATCH /notifications/:id/read for the same condition (issue #134).
   if (targetAddress && targetAddress !== address) {
-    return { authenticated: false, status: 401, error: 'Cannot modify notifications for another address' }
+    return { authenticated: false, status: 403, error: 'Cannot modify notifications for another address' }
   }
 
   return { authenticated: true, address }

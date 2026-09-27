@@ -4,14 +4,28 @@
 
 // The complete set of values each status column may hold, in one place (#73).
 // The database CHECK constraints — inline in src/db/schema.sql and added to
-// existing databases by src/db/migrations/0012_status_check_constraints.sql —
-// must accept exactly these, and test/status-constraints.test.ts fails if the
-// two drift. `'cancelled'` is a declared loan-proposal state that no handler
-// writes yet; it is kept deliberately (the loan_exp work will use it for
-// expired proposals) rather than dropped.
-export const LOAN_PROPOSAL_STATUSES = ['pending', 'approved', 'rejected', 'cancelled'] as const
+// existing databases by src/db/migrations/0012_status_check_constraints.sql
+// (and, for `approved_pending_disbursement`, 0017_approved_pending_disbursement_status.sql)
+// — must accept exactly these, and test/status-constraints.test.ts fails if
+// the two drift. `'cancelled'` is a declared loan-proposal state that no
+// handler writes yet; it is kept deliberately (the loan_exp work will use it
+// for expired proposals) rather than dropped. `'approved_pending_disbursement'`
+// is the state a proposal sits in between reaching quorum and actually being
+// disbursed once the treasury can cover it (`loan_wait`/`tre_wait`, issue #125).
+export const LOAN_PROPOSAL_STATUSES = [
+  'pending',
+  'approved',
+  'rejected',
+  'cancelled',
+  'approved_pending_disbursement',
+] as const
 export const LOAN_STATUSES = ['active', 'repaid', 'defaulted'] as const
-export const TREASURY_PROPOSAL_STATUSES = ['pending', 'executed', 'rejected'] as const
+export const TREASURY_PROPOSAL_STATUSES = [
+  'pending',
+  'executed',
+  'rejected',
+  'approved_pending_disbursement',
+] as const
 
 export type LoanProposalStatus = (typeof LOAN_PROPOSAL_STATUSES)[number]
 export type LoanStatus = (typeof LOAN_STATUSES)[number]
@@ -34,9 +48,19 @@ export interface MemberRow {
 
 export interface MemberSummary {
   member: MemberRow
+  // Capped at LOANS_EMBED_LIMIT (issue #165) — loans_truncated is true when
+  // the member has more than that; the full history is paginated separately
+  // via GET /api/loans?borrower=<address>. The aggregate counts in
+  // `position` below are computed over ALL of the member's loans regardless
+  // of this cap, never just the embedded page.
   loans: (LoanRow & { interest_charge: string; repaid_amount: string })[]
+  loans_total_count: number
+  loans_truncated: boolean
   unread_notifications: number
   position: {
+    // Share of currently-active total contribution/stake (issue #164) —
+    // matches ourdao-contracts' calculate_exit_share, which is 0 for any
+    // non-active member and otherwise contribution / total_active_contributions.
     contribution_share_bps: string
     stake_share_bps: string
     repaid_loans_count: number
@@ -56,6 +80,7 @@ export interface LoanProposalRow {
   votes_for: string
   votes_against: string
   voter_count: number
+  tallies_weighted: boolean
   created_ledger: number | null
   updated_at: string
 }
@@ -83,6 +108,7 @@ export interface TreasuryProposalRow {
   votes_for: string
   votes_against: string
   voter_count: number
+  tallies_weighted: boolean
   created_ledger: number | null
   executed_ledger: number | null
   updated_at: string
@@ -111,6 +137,7 @@ export interface EventRow {
   topics: unknown
   data: unknown
   tx_hash: string | null
+  decode_error: string | null
   created_at: string
 }
 
@@ -193,4 +220,7 @@ export interface DAOStats {
   estimatedLagSeconds: number | null
   secondsSinceUpdate: number | null
   indexerStale: boolean
+  // Open SSE stream connections on this process (issue #156). In-process
+  // only — with more than one API instance the figures are per-instance.
+  connectedStreams: number
 }

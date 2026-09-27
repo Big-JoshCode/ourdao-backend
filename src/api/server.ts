@@ -1,4 +1,5 @@
-import Fastify, { type FastifyInstance } from 'fastify'
+import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
+import { randomUUID } from 'node:crypto'
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import etag from '@fastify/etag'
@@ -6,8 +7,8 @@ import swagger from '@fastify/swagger'
 import swaggerUi from '@fastify/swagger-ui'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
+import { registerErrorHandling } from './errors.js'
 import { registerRoutes } from './routes/index.js'
-import { registerStreamEndpoint } from './stream.js'
 import { MemoryNonceStore, PostgresNonceStore, type NonceStore } from '../auth.js'
 import { readFileSync } from 'fs'
 import { dirname, join } from 'path'
@@ -23,28 +24,58 @@ interface PackageJson {
   version: string
 }
 
-// Helper to read package.json version
-function readPackageVersion(): string {
+// Read once at module load — the version cannot change while the process
+// is running, so there is no reason for `/version` to hit the filesystem
+// on every request (issue #166). `/version` sits in the rate limiter's
+// allowList alongside `/health` and `/ready`, so it is otherwise the one
+// unthrottled endpoint that would do disk I/O per call.
+function readPackageVersion(): { version: string; error?: unknown } {
   try {
     const __dirname = dirname(fileURLToPath(import.meta.url))
     const pkgPath = join(__dirname, '../../package.json')
     const pkg = JSON.parse(readFileSync(pkgPath, 'utf-8')) as PackageJson
-    return pkg.version
-  } catch {
-    return 'unknown'
+    return { version: pkg.version }
+  } catch (error) {
+    return { version: 'unknown', error }
   }
 }
 
-export async function buildServer(): Promise<FastifyInstance> {
+const packageVersionResult = readPackageVersion()
+
+export interface BuildServerOptions {
+  /**
+   * Override the Fastify logger. Production passes nothing and gets the
+   * configured Pino logger; tests pass a capturing stream to assert that a
+   * failure's full detail (and its correlation id) reach the log.
+   */
+  logger?: FastifyServerOptions['logger']
+}
+
+export async function buildServer(opts: BuildServerOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
-    logger: { level: process.env.LOG_LEVEL ?? 'info' },
+    logger: opts.logger ?? { level: config.http.logLevel },
     trustProxy: config.http.trustProxy === 'true',
+    // The request id doubles as the error-envelope correlation id (issue #81),
+    // so make it a random uuid rather than the default per-process counter.
+    genReqId: () => randomUUID(),
   })
+
+  // One error shape for every failure — installed before routes so every child
+  // context inherits it (issue #81).
+  registerErrorHandling(app)
+
+  // A failed package.json read is reported once at startup, rather than
+  // silently returning 'unknown' from every future /version call — a
+  // packaging mistake (e.g. the relative path resolving differently from
+  // dist/ than from src/) should fail visibly, not forever (issue #166).
+  if (packageVersionResult.error) {
+    app.log.error({ err: packageVersionResult.error }, 'Failed to read package.json version; /version will report "unknown"')
+  }
 
   // Select nonce store implementation based on config (issue #66)
   let nonceStore: NonceStore
   if (config.db.nonceStore === 'postgres') {
-    nonceStore = new PostgresNonceStore(pool)
+    nonceStore = new PostgresNonceStore(pool, app.log)
   } else {
     nonceStore = new MemoryNonceStore()
   }
@@ -108,18 +139,15 @@ export async function buildServer(): Promise<FastifyInstance> {
     allowList: (req: { url: string }) => req.url === '/health' || req.url === '/ready' || req.url === '/version',
   })
 
-  // ── Routes ──
+  // ── Routes (including /api/stream — issue #158) ──
   await app.register(registerRoutes, { prefix: '/api', nonceStore })
-
-  // ── Stream endpoint (issue #63) ──
-  await registerStreamEndpoint(app, pool)
 
   // ── Liveness probe (issue #2) — no DB round trip ──
   app.get('/health', async () => ({ status: 'ok', contract: config.stellar.contractId || null }))
 
   // ── Version endpoint (issue #64) — build metadata ──
   app.get('/version', async () => ({
-    version: readPackageVersion(),
+    version: packageVersionResult.version,
     commit: process.env.SOURCE_COMMIT ?? 'unknown',
     buildDate: process.env.BUILD_DATE ?? 'unknown',
   }))
@@ -143,7 +171,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       // Table may not exist yet — treat as cold start
     }
 
-    if (!row || row.last_ledger === null) {
+    if (!row || row.last_ledger === null || row.updated_at === null) {
       return reply.code(200).send({
         status: 'ready',
         indexer: 'cold_start',
@@ -155,7 +183,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       })
     }
 
-    const updatedAt = new Date(row.updated_at!).getTime()
+    const updatedAt = new Date(row.updated_at).getTime()
     const secondsSinceUpdate = Math.floor((Date.now() - updatedAt) / 1000)
     const isStale = Date.now() - updatedAt > config.indexer.staleAfterMs
     const lastLedger = row.last_ledger
@@ -163,7 +191,9 @@ export async function buildServer(): Promise<FastifyInstance> {
     const ledgersBehind = lastLedger != null && tipLedger != null && tipLedger > lastLedger
       ? tipLedger - lastLedger
       : null
-    const estimatedLagSeconds = ledgersBehind != null ? ledgersBehind * 5 : null
+    const estimatedLagSeconds = ledgersBehind != null
+      ? ledgersBehind * config.stellar.ledgerCloseTimeSeconds
+      : null
 
     if (isStale) {
       return reply.code(503).send({

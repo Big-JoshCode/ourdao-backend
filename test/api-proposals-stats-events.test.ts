@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { FastifyInstance } from 'fastify'
 import { buildServer } from '../src/api/server.js'
+import { config } from '../src/config.js'
 import { pool, query } from '../src/db/index.js'
 import { closeDb, resetDb } from './db.js'
 
@@ -19,7 +20,9 @@ describe('API: proposals, stats, events, admin/log', () => {
       `INSERT INTO loan_proposals (id, borrower, amount) VALUES (1, 'GA', 100), (2, 'GA', 200)`
     )
     const res = await app.inject({ method: 'GET', url: '/api/proposals/loan' })
-    expect(res.json().map((p: { id: number }) => p.id)).toEqual([2, 1])
+    const body = res.json()
+    expect(body.map((p: { id: number }) => p.id)).toEqual([2, 1])
+    expect(body[0].tallies_weighted).toBe(false)
   })
 
   it('GET /api/proposals/treasury returns newest first', async () => {
@@ -27,7 +30,9 @@ describe('API: proposals, stats, events, admin/log', () => {
       `INSERT INTO treasury_proposals (id, amount, destination) VALUES (1, 100, 'GD'), (2, 200, 'GD')`
     )
     const res = await app.inject({ method: 'GET', url: '/api/proposals/treasury' })
-    expect(res.json().map((p: { id: number }) => p.id)).toEqual([2, 1])
+    const body = res.json()
+    expect(body.map((p: { id: number }) => p.id)).toEqual([2, 1])
+    expect(body[0].tallies_weighted).toBe(false)
   })
 
   it('GET /api/stats aggregates across all domain tables', async () => {
@@ -77,6 +82,8 @@ describe('API: proposals, stats, events, admin/log', () => {
     // Issue #45: the folded high-water mark and the RPC-observed tip are
     // reported separately rather than conflated into one column.
     expect(body.observedTipLedger).toBe(1200)
+    // Issue #139: derived from the configured ledger close time, not a bare literal.
+    expect(body.estimatedLagSeconds).toBe((1200 - 999) * config.stellar.ledgerCloseTimeSeconds)
     // Issue #43: a dashboard-visible count of quarantined events.
     expect(body.quarantinedEvents).toBe(1)
     // Lifetime money figures (issue #24), decimal strings.
@@ -84,6 +91,9 @@ describe('API: proposals, stats, events, admin/log', () => {
     expect(body.principalLent).toBe('9000')
     expect(body.principalRepaid).toBe('3000')
     expect(body.valueDefaulted).toBe('88')
+    // Issue #156: live SSE connection count is part of the stats payload.
+    expect(typeof body.connectedStreams).toBe('number')
+    expect(body.connectedStreams).toBeGreaterThanOrEqual(0)
   })
 
   it('GET /api/stats is cached: a burst of calls issues one set of queries (issue #18)', async () => {

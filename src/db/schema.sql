@@ -20,10 +20,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 );
 
 -- Indexer resume state (single row, id = 1).
--- `last_ledger_hash` is the ledger-hash of the RPC's reported tip at the time
--- the cursor was last advanced (Soroban getEvents exposes no per-event hash);
--- it is forensic context for a detected discontinuity, not a verified
--- processed-ledger hash. See issue #23 / README "Reorg detection".
+-- `last_ledger_hash` is the hash of `last_ledger` itself — the ledger
+-- actually folded to (issue #127) — fetched by sequence from the RPC
+-- (Soroban getEvents exposes no per-event hash). Re-checked against the
+-- RPC's current hash for that same sequence on every poll to catch a
+-- same-height fork the sequence-only continuity check can't see (issue
+-- #128). See README "Reorg detection".
 -- `observed_tip_ledger` (issue #45) is the RPC's most recently observed chain
 -- tip — freshness/reporting only, distinct from `last_ledger` (the highest
 -- ledger actually folded, which the reorg continuity check uses). An empty
@@ -50,7 +52,16 @@ CREATE TABLE IF NOT EXISTS events (
   topics      JSONB NOT NULL,
   data        JSONB NOT NULL,
   tx_hash     TEXT,
-  created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  decode_error TEXT,
+  created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+  -- Set when this event's derived-state fold has committed — independent of
+  -- the row's own existence, so a crash between the raw insert and the fold
+  -- (quarantine path) can be detected and retried rather than silently
+  -- skipped (issue #119). Declared last, matching where the
+  -- 0016_events_folded_at.sql ALTER TABLE physically appends it on a
+  -- database that already had this table (schema.sql's own column order
+  -- only governs a truly fresh bootstrap).
+  folded_at   TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS events_symbol_idx ON events (symbol);
 CREATE INDEX IF NOT EXISTS events_ledger_idx ON events (ledger);
@@ -100,7 +111,7 @@ CREATE TABLE IF NOT EXISTS loan_proposals (
   total_repayment NUMERIC(40,0) NOT NULL DEFAULT 0,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT loan_proposals_status_check
-                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled')),
+                  CHECK (status IN ('pending', 'approved', 'rejected', 'cancelled', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,
@@ -138,7 +149,7 @@ CREATE TABLE IF NOT EXISTS treasury_proposals (
   private         BOOLEAN NOT NULL DEFAULT false,
   status          TEXT NOT NULL DEFAULT 'pending'
                   CONSTRAINT treasury_proposals_status_check
-                  CHECK (status IN ('pending', 'executed', 'rejected')),
+                  CHECK (status IN ('pending', 'executed', 'rejected', 'approved_pending_disbursement')),
   votes_for       NUMERIC(40,0) NOT NULL DEFAULT 0,
   votes_against   NUMERIC(40,0) NOT NULL DEFAULT 0,
   voter_count     INTEGER NOT NULL DEFAULT 0,

@@ -25,6 +25,7 @@ This repository is one of three that make up OurDAO:
 
 - [Architecture](#architecture)
 - [Quick start](#quick-start)
+- [Deployment](#deployment)
 - [Configuration](#configuration)
 - [Database schema](#database-schema)
 - [Event catalog](#event-catalog)
@@ -78,6 +79,16 @@ npm start              # API
 npm run start:worker   # indexer
 ```
 
+## Deployment
+
+The full deployment guide is in **[`docs/DEPLOYMENT.md`](./docs/DEPLOYMENT.md)**. Key points that are easy to get wrong:
+
+- **The worker must run as a singleton.** Running two workers concurrently corrupts vote tallies through non-idempotent increments — the failure is silent. The API is stateless and can scale horizontally; the worker cannot.
+- **Set `START_LEDGER` before the first boot.** The public Soroban RPC retains roughly 24 hours of event history. If your contract was deployed before that window, set `START_LEDGER` to the contract's deploy ledger. Events older than the RPC window are permanently unavailable — you cannot fetch them later.
+- **Set `CORS_ORIGIN` to the real frontend origin.** It defaults to `http://localhost:3000`. Leaving it at the default silently blocks every browser request from the production frontend.
+- **`events` is the only table you must back up.** All other tables (`members`, `loan_proposals`, `loans`, etc.) are derived from it and can be rebuilt with `npm run reindex`.
+- **Repointing at a new `CONTRACT_ID` requires an explicit reset step.** The worker refuses to start if the configured contract id doesn't match the one stored in the cursor — see [Redeploying the contract](./docs/DEPLOYMENT.md#redeploying-the-contract) for options.
+
 ## Configuration
 
 All configuration is environment-driven — see [`.env.example`](./.env.example) for the full annotated list. Key values:
@@ -87,7 +98,9 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `CONTRACT_ID` | Deployed OurDAO contract id. **Required** for the indexer to run. |
 | `SOROBAN_RPC_URL` | Soroban RPC endpoint (defaults to public testnet). |
 | `NETWORK_PASSPHRASE` | Testnet by default; switch for mainnet. |
+| `STELLAR_LEDGER_CLOSE_TIME_SECONDS` | Nominal Stellar ledger close time in seconds, used by `/ready` to turn `ledgersBehind` into `estimatedLagSeconds` (default 5; not an SLA). |
 | `DATABASE_URL` | Postgres connection string (or set the individual `PG*` vars). |
+| `DB_POOL_MAX` | Max size of the shared request pool (default 10, node-postgres's own default made explicit — issue #152). `/api/stream` no longer takes a connection per client (see the `/api/stream` row below), so this only has to cover ordinary request concurrency. |
 | `START_LEDGER` / `START_LOOKBACK_LEDGERS` | Where to start indexing on a cold start. Public Soroban RPC only retains ~24h of events, so an old start ledger gets clamped to the oldest the RPC still serves. |
 | `POLL_INTERVAL_MS` / `EVENTS_PAGE_LIMIT` | Indexer poll cadence and page size. |
 | `POLL_MAX_BACKOFF_MS` | Cap for exponential backoff after consecutive poll failures (default 60s). |
@@ -101,8 +114,15 @@ All configuration is environment-driven — see [`.env.example`](./.env.example)
 | `RATE_LIMIT_WINDOW_MS` | Rate limit window in milliseconds (default 60000). |
 | `RATE_LIMIT_EVENTS_MAX` | Stricter rate limit for `GET /api/events` (default 30). |
 | `STATS_CACHE_MS` | How long (ms) an `/api/stats` result is cached in-process before it is recomputed (default 5000; `0` disables). Reported figures are at most this stale. |
+| `STREAM_MAX_CONNECTIONS` | Max concurrent `/api/stream` SSE connections per process (default 100). Excess connections get `503` + `Retry-After` (issue #156). |
+| `STREAM_MAX_CONNECTIONS_PER_IP` | Max concurrent stream connections per client IP (default 10). |
+| `STREAM_IDLE_TIMEOUT_MS` | Socket idle timeout for stream connections in ms (default 60000). Heartbeats keep healthy clients alive. |
+| `STREAM_RETRY_AFTER_SECONDS` | `Retry-After` value (seconds) on stream-cap `503` responses (default 30). |
 | `TRUST_PROXY` | Set to `"true"` behind a reverse proxy so rate limits apply per client IP. |
+| `LOG_LEVEL` | Pino log level for the Fastify server (`fatal`, `error`, `warn`, `info`, `debug`, `trace`, `silent`). Default `info` (logs a line per request). `silent` suppresses all request logging, which the test harness uses. |
 | `TEST_DATABASE_URL` | Separate database `npm test` runs against — never the dev DB. |
+
+**Note:** The indexer (worker process) uses `console.log`/`console.error` directly and does not respect `LOG_LEVEL`. Its output is always shown regardless of this setting.
 
 ## Database schema
 
@@ -129,7 +149,7 @@ On-chain `i128` amounts are stored as `NUMERIC(40,0)` (an i128's max value is ~1
 
 **Column-type rule for amounts vs. sequences.** On-chain `i128` amounts are `NUMERIC(40,0)` and cross the API boundary as strings. Ledger sequence numbers are `BIGINT` and are returned as JSON numbers — `src/db/index.ts` registers a `BIGINT → number` parser **scoped to this repo's connection pool**, not on the process-wide `pg.types` registry (a global parser silently truncated any `BIGINT` above 2⁵³, for every pg consumer in the process). Nothing else should be `BIGINT`: a token amount stored as `BIGINT` would be parsed to a `number` by that pool parser and lose precision above 2⁵³ with no error. Use `NUMERIC(40,0)` for any new amount column, and only `BIGINT` for a genuine ledger/sequence value.
 
-**Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
+**Vote tallies are stake-weighted, not a headcount.** The contract grants each voter `1 + min(stake / STAKE_WEIGHT_UNIT, MAX_STAKE_BONUS)` voting power (currently up to 6) and sums that into `for_votes`/`against_votes`. `votes_for`/`votes_against` mirror that (hence `NUMERIC(40,0)`, matching the contract's own field width, not a plain vote count); `voter_count` is the distinct-voter headcount alongside it, so a client can show both "7 members voted" and "carrying 19 voting power." **The contract doesn't publish the weight it applied yet** — `loan_vote`/`tre_vote`/`revealed` currently carry only `support` — so today every vote folds in as weight 1 regardless of stake, and `votes_for`/`votes_against` under-count for any staked voter until [the upstream fix](https://github.com/ourdao/ourdao-contracts) lands. The API explicitly surfaces a `tallies_weighted: false` flag on proposals until this is resolved. The decoder and handlers already read a `weight` field the moment the contract adds one, with no further backend change needed.
 
 **A loan's `outstanding` balance starts at `total_repayment`, not the principal.** The contract collects `total_repayment = amount + interest` on `repay_loan`, so a loan is never worth just its principal from a borrower's perspective. `loan_appr` doesn't publish `total_repayment` (only the disbursed `amount`), so the indexer sources it from the just-approved `loan_proposals` row instead — `loans.id == loan_proposals.id` is a documented contract invariant, and that row already carries `total_repayment` from `loan_req`/`loan_edit`. This depends on that proposal row existing, which it will unless the indexer started mid-history; if it's missing, `total_repayment` falls back to the principal. `due_time` has the same gap — the contract computes it but doesn't publish it on `loan_appr` — so it's `NULL` until that's fixed upstream. `GET /api/loans` and `/api/loans/:id` also expose `interest_charge` and `repaid_amount`, both derived from `total_repayment` at read time.
 
@@ -158,12 +178,16 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 | `loan_req` | `id, borrower, amount, total_repayment` | inserts a pending `loan_proposals` row |
 | `loan_edit` | `proposal_id, borrower, new_amount, total_repayment` | updates the proposal |
 | `loan_vote` | `proposal_id, voter, support`, plus a reserved `weight` not yet published (see above) | adds the vote's weight to the tally, bumps `voter_count` |
+| `loan_wait` | `id, amount` | the proposal reached quorum but the treasury can't cover it yet — marks it `approved_pending_disbursement` (issue #125). A later `disburse_approved_loan` call resolves this and republishes `loan_appr` |
+| `loan_rej` | `id, for_votes, against_votes` | an early rejection when the votes still outstanding can no longer reach quorum (issue #124) — marks the proposal `rejected`, distinct from `loan_exp`'s post-window keeper path below |
 | `loan_appr` | `id, borrower, amount`, plus a reserved `due_time` not yet published | marks the proposal approved, opens a `loans` row seeded with `total_repayment` from the matching proposal (not the bare principal — see below), flags the borrower's `has_active_loan` |
 | `loan_rpy` | `loan_id, borrower, outstanding` | updates outstanding balance; marks `repaid` when it hits zero |
 | `loan_dflt` | `loan_id, borrower, penalty` | marks the loan `defaulted`, slashes the borrower's `contribution` by the penalty (clamped at zero), bumps `defaults_count`, clears `has_active_loan` — idempotent, so redelivering the same event is a no-op past the first application |
 | `interest` | `interest, active` | no per-member breakdown to attribute, but folded into `dao_totals.interest_collected` and one `interest_distributions` row (issue #24). `interest` is interest *collected* — the contract keeps the indivisible per-member remainder, so it slightly exceeds what members were credited. Per-member yield is still surfaced via `claimed`. |
 | `tre_prop` | `id, amount, destination, private` | inserts a pending `treasury_proposals` row |
 | `tre_vote` | `id, voter, support`, plus a reserved `weight` not yet published | adds the vote's weight to the tally, bumps `voter_count` |
+| `tre_wait` | `id, amount` | treasury equivalent of `loan_wait` above (issue #125) — marks the proposal `approved_pending_disbursement` |
+| `tre_rej` | `id, for_votes, against_votes` | treasury equivalent of `loan_rej` above (issue #124) — marks the proposal `rejected` |
 | `tre_exec` | `id, amount, destination` | marks the proposal executed, notifies the recipient |
 | `staked` / `unstaked` | `member, amount, new_stake` | updates the member's stake |
 | `name_reg` | `name, owner` | updates the member's registered name |
@@ -234,6 +258,37 @@ All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?afte
 
 On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
 
+### Reconnecting and missed changes
+
+Every SSE frame on `/api/stream` carries an `id:` field. It is the highest ledger sequence number this connection has been shown a change for — not `Date.now()` — so it is both monotonic (per connection) and meaningful (it corresponds to a real point in the indexed chain, and only advances, never repeats a lower value). Heartbeats and the initial "Connected to stream" message report the same id, not a fresh one, since they carry no change of their own.
+
+Browsers implementing `EventSource` remember the last `id:` they saw and resend it automatically as a `Last-Event-ID` header when they reconnect (after a sleeping laptop, a proxy timeout, a rolling deploy, …). The server reads that header and, if it knows a current ledger, immediately sends a `resync` event before anything else:
+
+```json
+{ "type": "resync", "payload": { "missed": true, "lastKnownLedger": 512034 } }
+```
+
+`missed: true` means at least one change happened while this client was away; `missed: false` means it reconnected caught up. A fresh connection with no `Last-Event-ID` gets no `resync` event at all — there's nothing to compare against.
+
+**This is a "you may be behind, go refetch" signal, not event replay.** The server does not buffer or replay the individual changes that happened while disconnected — deliberately: every message on this stream is already just a lightweight "X changed, go refetch" pointer rather than a full payload (see the endpoint table above), so replaying old signals wouldn't tell a client anything more precise than "something changed, refetch it" — which `resync: { missed: true }` already says, without a durable buffer to build and bound. A client that needs precise historical detail should page `/api/events` instead, which is the actual source of truth and already supports cursor-based pagination.
+
+**Clients should keep their polling fallback.** Because there is no replay, a client that was disconnected long enough to miss changes still needs to refetch from the REST endpoints — the stream tells you *that* you're behind, not *what* changed. `ourdao-frontend`'s existing 15s `/api/stats` poll (or equivalent per-resource refetches) remains the correct way to recover, with the stream layered on top purely to make the common case (already caught up, or only briefly behind) near-instant instead of waiting for the next poll tick.
+
+### Errors
+
+Every error response — a deliberate `4xx` from a route, a failed request body, or anything thrown while handling the request — uses one shape:
+
+```json
+{ "error": "loan not found", "correlationId": "b1f2c3d4-..." }
+```
+
+- **`error`** is a short, safe, human-readable string. It never contains a stack trace, SQL, or raw database driver text. Deliberate `4xx` messages (`invalid loan id`, `address query param is required`, …) are passed through unchanged; every `5xx` is a generic string (`internal server error`) with the real cause written only to the server log.
+- **`correlationId`** is the request id. It is also returned in the `x-correlation-id` response header (on success and failure alike) and printed as `reqId` on the matching server-side log line, so a user-reported failure can be traced to its log entry.
+
+Postgres failures are mapped to a sensible status rather than an opaque `500`: a unique violation → `409`, a check violation or missing required value → `422`, and a connection failure → `503`. The driver's message (which would name columns, constraints and types) is logged, never returned.
+
+> `429` responses from the rate limiter (`@fastify/rate-limit`) keep that plugin's own body shape (`{ statusCode, error, message }`) and are the one exception to the envelope above.
+
 ### Caching
 
 All `GET` endpoints support `ETag` and conditional requests (`If-None-Match`), returning `304 Not Modified` when the underlying data is unchanged. `Cache-Control` headers are set appropriately:
@@ -245,9 +300,15 @@ All `GET` endpoints support `ETag` and conditional requests (`If-None-Match`), r
 
 Stellar's consensus gives fast finality, so a deep reorg is genuinely unlikely — but the indexer now *notices* one rather than silently folding events from a diverged history (issue #23):
 
-- The cursor stores `last_ledger` (and `last_ledger_hash`, the RPC tip hash at each advance — Soroban's `getEvents` exposes no per-event ledger hash, so deeper verification isn't possible).
-- Each poll checks continuity: if the RPC's reported latest ledger is **below** the last folded ledger, or a fetched page contains an event from a ledger already folded past, the indexer **halts** with a loud log line instead of retrying.
-- **Recovery:** confirm the true chain state, then run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues.
+- The cursor stores `last_ledger` and `last_ledger_hash` — the hash of that same ledger, fetched by sequence from the RPC (Soroban's `getEvents` exposes no per-event ledger hash, so this is the only way to get one).
+- Each poll checks continuity two ways: if the RPC's reported latest ledger is **below** the last folded ledger, or a fetched page contains an event from a ledger already folded past, the indexer **halts** with a loud log line instead of retrying. It also re-fetches the RPC's current hash for `last_ledger` and compares it against what's stored (issue #128) — this catches a **same-height fork**, where history diverges without the ledger sequence ever moving backwards, which the sequence-only checks can't see. A ledger the RPC has since pruned is treated as unverifiable, not as a fork.
+- **Recovery:** stop the indexer worker (`node dist/worker.js`) and run `npm run reindex` (`node dist/indexer/reindex.js` in the container). It truncates the derived tables and rebuilds them from the raw `events` log in one transaction — the log is authoritative and untouched. A rebuild produces state identical to the incremental fold (asserted by a test), so `reindex` is also the repair path for the historical-data bugs tracked in other issues.
+- **Worker serialization (Advisory Lock):** Both `reindex` and the worker's event fold loops acquire a dedicated session-level Postgres advisory lock (`0x0d400001`). If a reindex is attempted while a worker is running or folding, it fails immediately with an actionable error rather than racing to corrupt derived state.
+- **Streaming & Memory Bounds:** The rebuild streams the event log via keyset pagination over `(ledger, id)` in batches (default 1,000) inside a single transaction, keeping Node.js memory flat (~40–60 MB RSS) regardless of event log size (e.g., 100k+ events). Progress is logged periodically with event counts, percentage, throughput (events/s), and estimated ETA.
+- **Rebuild Performance Expectations:**
+  - **10k events:** ~1–2 seconds, ~45 MB peak RSS.
+  - **100k events:** ~10–20 seconds, ~55 MB peak RSS.
+  - **500k events:** ~50–90 seconds, ~60 MB peak RSS.
 - **Unrecoverable:** events that were orphaned *and* already pruned from the RPC's ~24h window can't be re-fetched; `reindex` rebuilds from whatever the raw log holds.
 - **`last_ledger` only ever advances to a ledger whose events were actually folded (issue #45).** An earlier version fell back to the RPC's reported chain tip on an empty `getEvents` page, which conflated "highest ledger folded" with "how current the RPC is" — during catch-up, one empty page could jump `last_ledger` to the tip, and the very next real (but still historically-earlier) page would then look like a rewind and trigger a false halt. The RPC-observed tip is tracked in its own column, `observed_tip_ledger` — freshness reporting only (`/ready`, `/api/stats.observedTipLedger`), never fed into the continuity check above.
 
@@ -257,6 +318,7 @@ A handler bug used to be able to wedge the indexer permanently: `ingestPage` fol
 
 - The poller can't tell a transient failure (RPC hiccup, a DB restart — expected to clear on retry) from a deterministic one (a handler bug, a value that overflows its column) from the error alone. It infers it from repetition: if the *same* page fails with the *same* error `INDEXER_QUARANTINE_AFTER_FAILURES` times in a row (default 3), that's not transient.
 - Once that threshold is hit, the page is retried **one event per transaction** instead of the whole page at once. Each event's raw log row is written (and stays written) regardless of whether folding it succeeds; if folding throws, that one transaction rolls back and the event is recorded in `failed_events` (id, symbol, ledger, error) instead — every other event in the page still folds normally, and the cursor advances past all of them.
+- On this per-event path, the raw log write and the fold necessarily commit as two separate transactions (the raw write has to survive a fold that then fails). `events.folded_at` tracks fold completion independently of the row's own existence (issue #119), so a crash between the two — the raw row committed, the fold didn't — is retried on the next pass instead of being mistaken for an already-handled event. A failure recording an event to `failed_events` itself (issue #120) is logged and does not stop the rest of the page from folding.
 - A `ReorgDetectedError` is never quarantined, on either path — a genuine rewind still halts the indexer immediately, exactly as in [Reorg detection](#reorg-detection) above.
 - Once the handler bug is fixed, `npm run reindex` folds a previously-quarantined event correctly with no extra step — it replays the raw log directly through `applyEvent`, independent of the poller's quarantine bookkeeping.
 - Quarantined events are visible at `GET /api/admin/failed-events` and counted in `GET /api/stats.quarantinedEvents`.
@@ -297,12 +359,15 @@ Tests apply the real `schema.sql` and truncate all tables between runs (`test/db
 - **No custody, ever.** This service holds no private keys and has no code path that constructs, signs, or submits a transaction. It is a read model over public on-chain events.
 - **Fail-soft, not fail-open.** If the indexer falls behind or the RPC endpoint is unreachable, reads degrade to stale/empty data (surfaced to the frontend as such) rather than the API crashing or serving incorrect state.
 - **CORS is explicit.** `CORS_ORIGIN` defaults to `http://localhost:3000` in both code and config — a production deployment should set this to the real frontend origin. Setting it to `*` is supported as an explicit opt-in but logs a warning at startup.
-- **Input handling.** All route parameters (addresses, ids, cursors) are validated before being used in parameterized queries — no raw string interpolation into SQL anywhere in the codebase.
+- **Input handling.** All route parameters (addresses, ids, cursors) are validated before being used in parameterized queries — no raw string interpolation of attacker-influenceable values into SQL anywhere in the codebase. Stream notifications use `SELECT pg_notify($1, $2)` with bound parameters (issue #153); the shared listener's one-time `LISTEN` (issue #152) still interpolates channel names, drawn from the frozen `STREAM_CHANNELS` constant, never user input.
 - **Supported authentication address types.** The signature-based auth on the notification mutation endpoints accepts:
   - **`G…` (ed25519)** — verified directly against the account's public key.
   - **`M…` (muxed)** — resolved to the underlying `G…` account and verified against its key. Sign the same `"<nonce>:<address>"` payload using the `M…` address as it appears in the header.
   - **`C…` (contract) accounts are not supported.** A Soroban contract account has no ed25519 key and authorizes through its `__check_auth` entrypoint, which requires an on-chain RPC call to verify. Authenticating with a `C…` address returns `400` with an explicit message rather than a misleading `401 "Invalid signature"`. If contract-wallet auth is needed, open an issue — it needs an RPC call in the auth path and a caching strategy.
+- **Dependency Scanning.** Dependencies are scanned weekly via Dependabot, and `npm audit` is run in CI to report on vulnerabilities.
 - **Rate limiting.** Global rate limiting (`@fastify/rate-limit`) is applied to all API endpoints, with a stricter per-route limit on `GET /api/events`. Health and readiness probes are exempt. Behind a reverse proxy, set `TRUST_PROXY=true` so limits apply per client IP. With in-process limiting, the effective global limit is `RATE_LIMIT_MAX × instance count`.
+- **`GET /api/stream` rate-limit treatment (issue #158).** The stream route is registered inside the `/api` plugin (same prefix and encapsulation as every other route) and is **not** exempt from the global request rate limiter — the initial handshake is a request and counts toward `RATE_LIMIT_MAX`. A long-lived open socket is not a request in the sense the limiter models, so open connections are bounded separately by `STREAM_MAX_CONNECTIONS` / `STREAM_MAX_CONNECTIONS_PER_IP` (issue #156); exceeding either returns `503` with `Retry-After`. The live count is exposed as `connectedStreams` on `GET /api/stats`.
+- **`GET /api/stream` is unauthenticated by design, and broadcasts only DAO-wide state (issue #160).** It never requires a wallet signature — any client can connect and `LISTEN` — but every channel it can subscribe to (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `interest`) describes state that's already public via the corresponding `GET` endpoints; a connected client learns nothing an unauthenticated caller couldn't already fetch directly. There is deliberately no per-member channel: a member's own notification feed (loan amounts, defaults, private-vote participation) is only ever available from the authenticated `GET /api/notifications`, and clients are expected to poll that themselves rather than have it pushed over an unauthenticated stream. A client that only cares about a subset of state can request it with `?channels=loans,loan_proposals` (comma-separated `STREAM_CHANNELS` keys) instead of receiving every channel.
 
 ## Status
 

@@ -2,10 +2,11 @@ import type { rpc } from '@stellar/stellar-sdk'
 import type { PoolClient } from 'pg'
 import { config, assertContractConfigured } from '../config.js'
 import { pool, queryOne } from '../db/index.js'
-import { server, getLatestLedger, getLatestLedgerInfo } from '../stellar/rpc.js'
+import { server, getLatestLedger, getLatestLedgerInfo, getLedgerHash } from '../stellar/rpc.js'
 import { decodeEvent, type DecodedEvent } from '../stellar/events.js'
 import { applyEvent } from './handlers.js'
 import { DERIVED_TABLES, resetDaoTotals } from './derived-tables.js'
+import { REINDEX_LOCK_KEY } from './reindex.js'
 
 interface CursorRow {
   paging_token: string | null
@@ -42,13 +43,31 @@ export class ReorgDetectedError extends Error {
 export async function resetForContractChange(): Promise<void> {
   const client = await pool.connect()
   try {
+    // Use pg_advisory_xact_lock instead of pg_try_advisory_lock (issue #137):
+    // pg_advisory_xact_lock is transaction-scoped and released on COMMIT,
+    // whereas pg_try_advisory_lock is session-scoped and can be left held
+    // if the process is killed between COMMIT and the explicit unlock.
+    const lockRes = await client.query<{ pg_advisory_xact_lock: boolean }>(
+      'SELECT pg_advisory_xact_lock($1)',
+      [REINDEX_LOCK_KEY]
+    )
+    if (!lockRes.rows[0]?.pg_advisory_xact_lock) {
+      throw new Error(
+        'Cannot reset database for contract change: reindex or fold operation is currently in progress (advisory lock held)'
+      )
+    }
+
     await client.query('BEGIN')
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
     await resetDaoTotals(client)
     await client.query('DELETE FROM indexer_cursor WHERE id = 1')
     await client.query('COMMIT')
   } catch (err) {
-    await client.query('ROLLBACK')
+    try {
+      await client.query('ROLLBACK')
+    } catch {
+      // Rollback failure ignored
+    }
     throw err
   } finally {
     client.release()
@@ -133,18 +152,35 @@ async function resolveStartLedger(): Promise<number> {
   return Math.max(1, latest - config.indexer.startLookbackLedgers)
 }
 
-/** Insert one event's raw log row (idempotent on its unique id). Returns
- *  whether this call actually inserted it (`false` means already logged by
- *  an earlier attempt). Shared by the whole-page path and the per-event
- *  quarantine path (issue #43) so both write the same row the same way. */
+/** Insert one event's raw log row (idempotent on its unique id) and report
+ *  whether it still needs folding — i.e. `folded_at IS NULL` on the row that
+ *  now exists, regardless of whether *this* call did the inserting.
+ *
+ *  Fold completion is tracked independently of raw-row existence (issue
+ *  #119): the quarantine path commits this insert on its own, separately
+ *  from the fold that follows, so a crash in between leaves a raw row with
+ *  no fold. Keying "needs fold" off the row's own `folded_at` (rather than
+ *  off whether this INSERT was the one that created the row) means that on
+ *  retry the row is found to still need folding instead of being skipped.
+ *
+ *  Shared by the whole-page path and the per-event quarantine path (issue
+ *  #43) so both write the same row the same way. */
 async function insertRawEvent(client: PoolClient, ev: DecodedEvent): Promise<boolean> {
-  const ins = await client.query(
-    `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash)
-     VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-     ON CONFLICT (id) DO NOTHING`,
-    [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash]
+  const res = await client.query<{ folded_at: string | null }>(
+    `INSERT INTO events (id, ledger, closed_at, contract_id, symbol, topics, data, tx_hash, decode_error)
+     VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+     ON CONFLICT (id) DO UPDATE SET id = events.id
+     RETURNING folded_at`,
+    [ev.id, ev.ledger, ev.closedAt, ev.contractId, ev.symbol, JSON.stringify(ev.topics), JSON.stringify(ev.data), ev.txHash, ev.decodeError ?? null]
   )
-  return ins.rowCount === 1
+  return res.rows[0]?.folded_at == null
+}
+
+/** Mark an event's row as folded — set in the same transaction as the fold
+ *  itself so `folded_at` is never non-null for a fold that didn't commit
+ *  (issue #119). */
+async function markFolded(client: PoolClient, id: string): Promise<void> {
+  await client.query('UPDATE events SET folded_at = now() WHERE id = $1', [id])
 }
 
 /** Persist a page of events + their derived side effects atomically.
@@ -157,7 +193,19 @@ async function insertRawEvent(client: PoolClient, ev: DecodedEvent): Promise<boo
 async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): Promise<void> {
   if (events.length === 0) return
   const client = await pool.connect()
+  let lockAcquired = false
   try {
+    const lockRes = await client.query<{ pg_try_advisory_lock: boolean }>(
+      'SELECT pg_try_advisory_lock($1)',
+      [REINDEX_LOCK_KEY]
+    )
+    if (!lockRes.rows[0]?.pg_try_advisory_lock) {
+      throw new Error(
+        'Cannot ingest events: reindex is currently in progress (advisory lock held)'
+      )
+    }
+    lockAcquired = true
+
     await client.query('BEGIN')
     for (const raw of events) {
       const ev = decodeEvent(raw)
@@ -171,20 +219,35 @@ async function ingestPage(events: rpc.Api.EventResponse[], lastLedger: number): 
         )
       }
       // Raw log first (idempotent on the unique event id), then derived state.
-      const isNew = await insertRawEvent(client, ev)
+      const needsFold = await insertRawEvent(client, ev)
       // Fold only on first sight of an event id. A re-delivered page then
       // can't re-apply increments (issue #24, and the vote-tally hazard) —
-      // raw insert and fold are in one transaction, so isNew means
-      // "not yet folded".
-      if (isNew) {
+      // raw insert, fold, and the folded_at update are all in one
+      // transaction here, so needsFold accurately reflects "not yet folded"
+      // (issue #119).
+      if (needsFold) {
         await applyEvent(client, ev)
+        await markFolded(client, ev.id)
       }
     }
     await client.query('COMMIT')
   } catch (err) {
-    await client.query('ROLLBACK')
+    if (lockAcquired) {
+      try {
+        await client.query('ROLLBACK')
+      } catch {
+        // Rollback failure ignored
+      }
+    }
     throw err
   } finally {
+    if (lockAcquired) {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1)', [REINDEX_LOCK_KEY])
+      } catch (err) {
+        console.error('[indexer] failed to release advisory lock:', err)
+      }
+    }
     client.release()
   }
 }
@@ -198,6 +261,31 @@ async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise
   console.error(`[indexer] quarantined event ${ev.id} (${ev.symbol}) at ledger ${ev.ledger}: ${message}`)
 }
 
+/** Record a quarantined event, tolerating a failure of the bookkeeping
+ *  insert itself (issue #120). Without this guard, an error here — a
+ *  constraint violation, disk full, a dropped connection — propagates out of
+ *  `ingestEventQuarantined`, aborting the `for` loop in
+ *  `ingestPageWithQuarantine` before it reaches any later event in the page
+ *  and before it resets `quarantineState`. The page is retried from the top
+ *  on the next poll, so nothing is stranded (`insertRawEvent`'s `folded_at`
+ *  check — issue #119 — still sees this event as needing a fold), but every
+ *  event after the one that hit the bookkeeping failure sits unfolded for
+ *  an extra pass, and the failure itself would otherwise go unlogged.
+ *
+ *  Swallowing it here instead lets the loop finish the rest of the page and
+ *  logs the failure loudly, so it isn't silent. */
+async function recordQuarantinedEventSafely(ev: DecodedEvent, error: unknown): Promise<void> {
+  try {
+    await recordQuarantinedEvent(ev, error)
+  } catch (recordErr) {
+    const recordMsg = recordErr instanceof Error ? recordErr.message : String(recordErr)
+    console.error(
+      `[indexer] failed to record quarantined event ${ev.id} (${ev.symbol}) in failed_events — ` +
+        `it was NOT folded and will be retried next pass: ${recordMsg}`
+    )
+  }
+}
+
 /** Fold exactly one event, each side in its own transaction (issue #43):
  *  the raw log insert commits on its own, so it survives untouched even if
  *  folding fails below — the append-only `events` row is never rolled back
@@ -206,7 +294,14 @@ async function recordQuarantinedEvent(ev: DecodedEvent, error: unknown): Promise
  *  recorded in `failed_events` instead — the rest of the page's events are
  *  unaffected, and the cursor still advances past this one. A ReorgDetectedError
  *  is never caught here; it propagates so the indexer still halts on a
- *  genuine rewind. */
+ *  genuine rewind.
+ *
+ *  Because the raw insert and the fold commit separately, a crash between
+ *  them (deploy, OOM, SIGKILL) would previously strand the row unfolded
+ *  forever — on restart the row already existed, so it looked already
+ *  handled (issue #119). `insertRawEvent`'s `folded_at` check makes
+ *  "needs folding" independent of "row exists", so that crash window is
+ *  just retried on the next pass instead. */
 async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Promise<void> {
   if (typeof ev.ledger === 'number' && lastLedger > 0 && ev.ledger < lastLedger) {
     throw new ReorgDetectedError(
@@ -214,25 +309,41 @@ async function ingestEventQuarantined(ev: DecodedEvent, lastLedger: number): Pro
     )
   }
 
-  const rawClient = await pool.connect()
-  let isNew: boolean
+  const client = await pool.connect()
+  let lockAcquired = false
   try {
-    isNew = await insertRawEvent(rawClient, ev)
-  } finally {
-    rawClient.release()
-  }
-  if (!isNew) return // already folded by an earlier attempt at this page
+    const lockRes = await client.query<{ pg_try_advisory_lock: boolean }>(
+      'SELECT pg_try_advisory_lock($1)',
+      [REINDEX_LOCK_KEY]
+    )
+    if (!lockRes.rows[0]?.pg_try_advisory_lock) {
+      throw new Error(
+        'Cannot fold quarantined event: reindex is currently in progress (advisory lock held)'
+      )
+    }
+    lockAcquired = true
 
-  const foldClient = await pool.connect()
-  try {
-    await foldClient.query('BEGIN')
-    await applyEvent(foldClient, ev)
-    await foldClient.query('COMMIT')
-  } catch (err) {
-    await foldClient.query('ROLLBACK')
-    await recordQuarantinedEvent(ev, err)
+    const needsFold = await insertRawEvent(client, ev)
+    if (!needsFold) return // already folded by an earlier attempt at this page
+
+    try {
+      await client.query('BEGIN')
+      await applyEvent(client, ev)
+      await markFolded(client, ev.id)
+      await client.query('COMMIT')
+    } catch (err) {
+      await client.query('ROLLBACK')
+      await recordQuarantinedEventSafely(ev, err)
+    }
   } finally {
-    foldClient.release()
+    if (lockAcquired) {
+      try {
+        await client.query('SELECT pg_advisory_unlock($1)', [REINDEX_LOCK_KEY])
+      } catch (err) {
+        console.error('[indexer] failed to release advisory lock:', err)
+      }
+    }
+    client.release()
   }
 }
 
@@ -317,6 +428,22 @@ export async function fetchOnce(contractId: string): Promise<void> {
     )
   }
 
+  // Same-height fork check (issue #128): the coarse check above only catches
+  // a rewind that moves the sequence backwards. A same-height fork — history
+  // diverging without the ledger count going down — is invisible to it, but
+  // changes the hash of the ledger already folded to. Compare what's stored
+  // for `priorLedger` (issue #127: genuinely its hash now, not the tip's)
+  // against what the RPC reports for that same sequence today.
+  if (priorLedger > 0 && cursor?.last_ledger_hash) {
+    const actualHash = await getLedgerHash(priorLedger)
+    // null means the RPC has pruned that ledger — unverifiable, not a fork.
+    if (actualHash !== null && actualHash !== cursor.last_ledger_hash) {
+      throw new ReorgDetectedError(
+        `ledger ${priorLedger}'s hash changed from ${cursor.last_ledger_hash} to ${actualHash} — history diverged at the same height`
+      )
+    }
+  }
+
   const base = {
     filters: [{ type: 'contract' as const, contractIds: [contractId], topics: [] as string[][] }],
     limit: config.indexer.pageLimit,
@@ -330,6 +457,7 @@ export async function fetchOnce(contractId: string): Promise<void> {
   const drainStart = Date.now()
   let totalEvents = 0
   let lastLedger = cursor?.last_ledger ?? 0
+  let lastLedgerHash = cursor?.last_ledger_hash ?? null
   let observedTipLedger = cursor?.observed_tip_ledger ?? tip.sequence
   let cursorWritten = false
 
@@ -352,6 +480,8 @@ export async function fetchOnce(contractId: string): Promise<void> {
 
     // Advance cursor after every page (issue #3: per-page cursor advancement).
     const last = events[events.length - 1]
+    // Compute the token once (issue #138) and use for both persistence and
+    // the next request, so they never diverge if the process crashes mid-flight.
     const nextToken = last?.id ?? res.cursor ?? currentRequest.cursor ?? null
     // Highest ledger actually folded (issue #45): only advances when this
     // page had events. An empty page must never fall through to the RPC tip
@@ -363,8 +493,13 @@ export async function fetchOnce(contractId: string): Promise<void> {
     // never fed into the continuity check above or in ingestPage.
     const newObservedTip = res.latestLedger ?? observedTipLedger
     if (nextToken !== cursor?.paging_token || foldedLedger !== lastLedger || newObservedTip !== observedTipLedger) {
-      await saveCursor(contractId, nextToken, foldedLedger, newObservedTip, tip.hash)
+      // Only re-fetch the hash when the folded ledger actually moved — the
+      // hash of a ledger already folded to doesn't change (issue #127: this
+      // stores the hash of `foldedLedger` itself, not the RPC tip's hash).
+      const foldedLedgerHash = foldedLedger !== lastLedger ? await getLedgerHash(foldedLedger) : lastLedgerHash
+      await saveCursor(contractId, nextToken, foldedLedger, newObservedTip, foldedLedgerHash)
       lastLedger = foldedLedger
+      lastLedgerHash = foldedLedgerHash
       observedTipLedger = newObservedTip
       cursorWritten = true
     }
@@ -389,8 +524,8 @@ export async function fetchOnce(contractId: string): Promise<void> {
       break
     }
 
-    // Build next request from the response cursor
-    currentRequest = { ...base, cursor: res.cursor }
+    // Build next request using the same token computed above (issue #138)
+    currentRequest = { ...base, cursor: nextToken }
   }
 
   // On a genuinely idle contract with nothing new to report (no events, and
@@ -403,7 +538,31 @@ export async function fetchOnce(contractId: string): Promise<void> {
   }
 }
 
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
+/** Resolves after `ms`, or immediately if `signal` aborts first (issue
+ *  #121). The backoff delay after a failed poll can be up to
+ *  `POLL_MAX_BACKOFF_MS` (60s by default) — without racing it against the
+ *  abort signal, a SIGTERM arriving just after a failed poll would wait out
+ *  the entire backoff before the loop in `runIndexer` re-checks and exits.
+ *
+ *  Exported so this can be tested directly: `runIndexer` itself needs
+ *  CONTRACT_ID configured, which the test suite doesn't set. */
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve()
+      return
+    }
+    const onAbort = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
 
 /** Run the poll loop until stopped. Errors are logged and retried with
  *  exponential backoff (capped at `POLL_MAX_BACKOFF_MS`) so a stuck or down
@@ -449,7 +608,7 @@ export async function runIndexer(): Promise<void> {
           `[indexer] poll error (${consecutiveFailures} consecutive): ${msg} — retrying in ${delay}ms`
         )
       }
-      await sleep(delay)
+      await sleep(delay, abortController.signal)
     }
   } finally {
     running = false

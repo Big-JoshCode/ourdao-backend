@@ -18,6 +18,34 @@ export function bool(env: NodeJS.ProcessEnv, name: string, fallback = false): bo
   return v === 'true' || v === '1'
 }
 
+/** Pino log levels as documented at https://getpino.io/#/docs/api?id=level */
+const PINO_LEVELS = new Set(['fatal', 'error', 'warn', 'info', 'debug', 'trace', 'silent'])
+
+/** Parse a log level string, falling back to 'info' if invalid or empty. */
+export function logLevel(env: NodeJS.ProcessEnv, name: string, fallback = 'info'): string {
+  const v = env[name]
+  if (v === undefined || v === '') return fallback
+  const level = v.trim().toLowerCase()
+  return PINO_LEVELS.has(level) ? level : fallback
+}
+
+const NONCE_STORES = new Set(['postgres', 'memory'])
+
+/**
+ * Parse the NONCE_STORE env var, falling back to 'postgres' (with a logged
+ * warning) for anything unrecognized. An unvalidated typo here used to
+ * silently downgrade to the in-memory store — the exact multi-instance auth
+ * failure issue #66 was filed to fix (issue #118).
+ */
+export function nonceStore(env: NodeJS.ProcessEnv, name: string, fallback: 'postgres' | 'memory' = 'postgres'): 'postgres' | 'memory' {
+  const v = env[name]
+  if (v === undefined || v === '') return fallback
+  const value = v.trim().toLowerCase()
+  if (NONCE_STORES.has(value)) return value as 'postgres' | 'memory'
+  console.warn(`[config] Invalid NONCE_STORE "${v}" — falling back to "${fallback}". Expected one of: ${[...NONCE_STORES].join(', ')}`)
+  return fallback
+}
+
 /**
  * Parse the CORS_ORIGIN env var into a Fastify-compatible origin value.
  *
@@ -53,17 +81,39 @@ export function resolveConfig(env: NodeJS.ProcessEnv) {
     // INDEXER_STALE_AFTER_MS. In-process only: with more than one API
     // instance they may briefly disagree.
     statsCacheMs: int(env, 'STATS_CACHE_MS', 5_000),
+    // Issue #156: concurrent SSE stream bounds. Open streams no longer each
+    // cost a database connection (issue #152 — they share one process-wide
+    // LISTEN connection), but still cost a socket/file descriptor and a
+    // small amount of memory each, so these caps remain the real resource
+    // bound (the request rate limiter only covers connection attempts).
+    streamMaxConnections: int(env, 'STREAM_MAX_CONNECTIONS', 100),
+    streamMaxConnectionsPerIp: int(env, 'STREAM_MAX_CONNECTIONS_PER_IP', 10),
+    streamIdleTimeoutMs: int(env, 'STREAM_IDLE_TIMEOUT_MS', 60_000),
+    streamRetryAfterSeconds: int(env, 'STREAM_RETRY_AFTER_SECONDS', 30),
+    // Pino log level for the Fastify server (fatal, error, warn, info, debug, trace, silent).
+    // 'silent' suppresses all request logging, which the test harness uses.
+    logLevel: logLevel(env, 'LOG_LEVEL', 'info'),
   },
   db: {
     // pg reads PG* env vars automatically; connectionString wins when set.
     connectionString: str(env, 'DATABASE_URL') || undefined,
     // Nonce store implementation: 'postgres' for production (multi-instance), 'memory' for testing (issue #66)
-    nonceStore: str(env, 'NONCE_STORE', 'postgres') as 'postgres' | 'memory',
+    nonceStore: nonceStore(env, 'NONCE_STORE', 'postgres'),
+    // Issue #152: explicit request-pool size instead of relying on
+    // node-postgres's implicit default (also 10). Made explicit — and
+    // configurable — now that /api/stream no longer takes a connection per
+    // client (see src/api/stream.ts's shared listener), so this pool is
+    // sized for ordinary request concurrency only.
+    poolMax: int(env, 'DB_POOL_MAX', 10),
   },
   stellar: {
     contractId: str(env, 'CONTRACT_ID'),
     rpcUrl: str(env, 'SOROBAN_RPC_URL', 'https://soroban-testnet.stellar.org'),
     networkPassphrase: str(env, 'NETWORK_PASSPHRASE', 'Test SDF Network ; September 2015'),
+    // Stellar's nominal ledger close time (issue #139) — used by `/ready` to
+    // turn a ledger-count lag into an estimated seconds-behind figure. Not an
+    // SLA; the network can and does close slower or faster than this.
+    ledgerCloseTimeSeconds: int(env, 'STELLAR_LEDGER_CLOSE_TIME_SECONDS', 5),
   },
   indexer: {
     startLedger: int(env, 'START_LEDGER', 0),

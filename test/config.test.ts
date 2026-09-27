@@ -1,8 +1,9 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   assertContractConfigured,
   bool,
   int,
+  nonceStore,
   resolveConfig,
   str,
 } from '../src/config.js'
@@ -32,6 +33,22 @@ describe('config helpers', () => {
     expect(bool({ VALUE: 'false' }, 'VALUE', true)).toBe(false)
     expect(bool({ VALUE: 'unexpected' }, 'VALUE', true)).toBe(false)
   })
+
+  it('nonceStore accepts postgres/memory (any case, trimmed) and falls back with a warning otherwise (issue #118)', () => {
+    expect(nonceStore({}, 'NONCE_STORE')).toBe('postgres')
+    expect(nonceStore({ NONCE_STORE: '' }, 'NONCE_STORE')).toBe('postgres')
+    expect(nonceStore({ NONCE_STORE: 'memory' }, 'NONCE_STORE')).toBe('memory')
+    expect(nonceStore({ NONCE_STORE: ' Postgres ' }, 'NONCE_STORE')).toBe('postgres')
+
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      expect(nonceStore({ NONCE_STORE: 'redis' }, 'NONCE_STORE')).toBe('postgres')
+      expect(nonceStore({ NONCE_STORE: 'typo' }, 'NONCE_STORE', 'memory')).toBe('memory')
+      expect(warn).toHaveBeenCalledTimes(2)
+    } finally {
+      warn.mockRestore()
+    }
+  })
 })
 
 describe('resolveConfig', () => {
@@ -47,12 +64,18 @@ describe('resolveConfig', () => {
         rateLimitEventsMax: 30,
         trustProxy: 'false',
         statsCacheMs: 5000,
+        streamMaxConnections: 100,
+        streamMaxConnectionsPerIp: 10,
+        streamIdleTimeoutMs: 60000,
+        streamRetryAfterSeconds: 30,
+        logLevel: 'info',
       },
-      db: { connectionString: undefined },
+      db: { connectionString: undefined, nonceStore: 'postgres', poolMax: 10 },
       stellar: {
         contractId: '',
         rpcUrl: 'https://soroban-testnet.stellar.org',
         networkPassphrase: 'Test SDF Network ; September 2015',
+        ledgerCloseTimeSeconds: 5,
       },
       indexer: {
         startLedger: 0,
@@ -78,6 +101,8 @@ describe('resolveConfig', () => {
       CONTRACT_ID: 'C123',
       POLL_INTERVAL_MS: 'bad',
       INDEXER_RESET_ON_CONTRACT_CHANGE: '1',
+      STELLAR_LEDGER_CLOSE_TIME_SECONDS: '6',
+      DB_POOL_MAX: '25',
     })
     expect(resolved.http.port).toBe(4100)
     expect(resolved.http.host).toBe('127.0.0.1')
@@ -86,6 +111,19 @@ describe('resolveConfig', () => {
     expect(resolved.stellar.contractId).toBe('C123')
     expect(resolved.indexer.pollIntervalMs).toBe(5000)
     expect(resolved.indexer.resetOnContractChange).toBe(true)
+    expect(resolved.stellar.ledgerCloseTimeSeconds).toBe(6)
+    expect(resolved.db.poolMax).toBe(25)
+  })
+
+  it('falls back to postgres and warns when NONCE_STORE is unrecognized (issue #118)', () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+    try {
+      const resolved = resolveConfig({ NONCE_STORE: 'redis' })
+      expect(resolved.db.nonceStore).toBe('postgres')
+      expect(warn).toHaveBeenCalledTimes(1)
+    } finally {
+      warn.mockRestore()
+    }
   })
 })
 
