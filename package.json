@@ -20,7 +20,9 @@
     "typecheck": "tsc --noEmit -p tsconfig.json && tsc --noEmit -p tsconfig.test.json",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:coverage": "vitest run --coverage"
+    "test:coverage": "vitest run --coverage",
+    "openapi:generate": "tsx scripts/generate-openapi-spec.ts",
+    "openapi:validate": "tsx scripts/generate-openapi-spec.ts && git diff --exit-code openapi.json || (echo 'OpenAPI spec is out of sync. Run npm run openapi:generate and commit the changes.' && exit 1)"
   },
   "dependencies": {
     "@fastify/cors": "^10.0.1",
@@ -33,6 +35,8 @@
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
+    "@fastify/swagger": "^9.9.0",
+    "@fastify/swagger-ui": "^6.1.1",
     "@types/node": "^20.14.0",
     "@types/pg": "^8.11.10",
     "@vitest/coverage-v8": "^4.1.10",

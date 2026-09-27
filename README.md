@@ -174,34 +174,65 @@ The full topic-symbol → data-tuple mapping this service decodes (kept in sync 
 
 ## API reference
 
+**Machine-readable OpenAPI specification:** [`openapi.json`](./openapi.json)
+
+Interactive documentation is available at `/docs` when running the development server (`npm run dev`).
+
+### Quick reference
+
 Base path: `/api`.
 
-| Method & path | Description |
-|---|---|
-| `GET /health` | Liveness check + the currently configured contract id. No DB round trip. |
-| `GET /ready` | Readiness probe — checks Postgres reachability and indexer freshness. Returns `503` with a `reason` when Postgres is down or the indexer cursor is stale. |
-| `GET /api/stats` | Aggregate counts (members, loans, proposals) + defaulted-loan count/value + lifetime money figures (`interestCollected`, `principalLent`, `principalRepaid`, `valueDefaulted`, all decimal strings) + `quarantinedEvents` (issue #43) + `lastIndexedLedger` (highest ledger actually folded) and `observedTipLedger` (RPC-observed chain tip, issue #45) as the useful "folded to X, chain is at Y" pair. Cached in-process for `STATS_CACHE_MS`; sets `Cache-Control`. With more than one API instance the cached figures may briefly disagree. |
-| `GET /api/interest` | Interest-distribution history — one row per `interest` event (`amount` collected, `active_members` at that distribution). `?before=<ledger>` cursor. |
-| `GET /api/members` | Active members. |
-| `GET /api/members/:address` | Single member. |
-| `GET /api/members/:address/summary` | Member's dashboard data, including the member row, up to 100 loans, unread notification count, and their relative position to DAO totals (share percentages in basis points) in a single consistent snapshot. |
-| `GET /api/members/:address/activity` | Every event that names this address as a participant (joins, stakes, loan actions, votes), newest first (issue #26). `?before=<ledger>` cursor. Each entry is the decoded event: `id`, `symbol`, `ledger`, `timestamp`, `tx_hash`, and named `fields`. |
-| `GET /api/proposals/loan` | Loan proposals with stake-weighted vote tallies (`votes_for`/`votes_against`) and a distinct `voter_count`. |
-| `GET /api/loans` | Loans. Optional `?borrower=`, `?before=<id>` for pagination. `status` is `active`, `repaid`, or `defaulted` — a loan is marked defaulted once it's past due plus the policy's grace period (permissionless on-chain, see `ourdao-contracts`). Each loan includes derived `interest_charge` and `repaid_amount` fields. |
-| `GET /api/loans/:id` | Single loan, with the same derived `interest_charge`/`repaid_amount` fields. |
-| `GET /api/loans/:id/timeline` | A loan's full lifecycle in chronological order (issue #26): `loan_req`, `loan_edit`, `loan_vote`, `loan_appr`, `loan_rpy`, `loan_dflt`. Returns `{ "timeline": [...] }` where each entry is the decoded event — `id`, `symbol`, `ledger`, `timestamp`, `tx_hash`, and named `fields` (not raw JSONB). A nonexistent id returns an empty timeline (`200`), not a `404`. |
-| `GET /api/proposals/treasury` | Treasury proposals with stake-weighted vote tallies and a distinct `voter_count`. |
-| `GET /api/proposals/treasury/:id/timeline` | A treasury proposal's full lifecycle in chronological order (issue #26): `tre_prop`, `tre_vote`, `committed`, `revealed`, `tre_exec`. Same shape and empty-not-404 behaviour as the loan timeline. |
-| `GET /api/notifications?address=` | Notifications for an address. |
-| `PATCH /api/notifications/:id/read` | Mark one notification read. |
-| `PATCH /api/notifications/read-all?address=` | Mark every unread notification for an address read. |
-| `GET /api/events` | Raw event feed. Optional `?symbol=`, `?before=<id|ledger>`, `?after=<id|ledger>`, `?order=asc|desc`. |
-| `GET /api/admin/log` | Admin/governance audit trail — init, admin add/remove, threshold changes, policy changes, pause/unpause. |
-| `GET /api/documents?kind=&proposal_id=` | A proposal's attached-document history (issue #44) — existence/history only, never the content hash (still read live from the contract via `get_document`). `kind` (`loan` or `treasury`) and `proposal_id` are both required, since loan and treasury proposal ids are drawn from independent sequences and collide. `?before=<ledger>` cursor. |
-| `GET /api/admin/failed-events` | Quarantined events (issue #43) — the operator-facing detail behind `/api/stats.quarantinedEvents`. Each row has the event id, symbol, ledger, and the error that quarantined it; the raw `events` row itself is left untouched. |
-| `GET /api/stream` | Server-Sent Events stream of real-time change notifications (issue #63). Sends lightweight change signals like `members_changed`, `loan_proposals_changed` as the indexer folds events — clients refetch via the endpoints above. Each message includes the channel name and timestamp. The stream uses Postgres `LISTEN`/`NOTIFY` under the hood, so multiple API instances each fan out to their own clients independently without coordination. Reconnecting clients can check `Last-Event-ID` to detect missed notifications. Connection timeout and automatic reconnect are the client's responsibility (the stream sends periodic heartbeats every 30 seconds but has no server-side timeout). |
+**Core endpoints:**
+- `GET /health` — Liveness check + currently configured contract id (no DB round trip)
+- `GET /ready` — Readiness probe (checks Postgres reachability and indexer freshness)
+- `GET /version` — Build metadata (version, commit, build date)
+- `GET /api/stats` — Aggregate DAO statistics (members, loans, proposals, money figures, quarantine count, indexer state)
 
-All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?after=` are cursors: pass the `id` (or `ledger`) of the last row you saw to page. For `/api/events`, the cursor can be a deterministic `(ledger, id)` value (the event `id` string itself contains both) and ordering is strictly deterministic (`ledger DESC, id DESC` by default, or `ASC`). On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
+**Members:**
+- `GET /api/members` — Active members list
+- `GET /api/members/:address` — Single member details
+- `GET /api/members/:address/summary` — Member dashboard (member row, loans, notifications, relative position)
+- `GET /api/members/:address/activity` — Member's cross-entity activity feed
+
+**Loans:**
+- `GET /api/proposals/loan` — Loan proposals with vote tallies
+- `GET /api/loans` — Loans list (optional `?borrower=` filter)
+- `GET /api/loans/:id` — Single loan
+- `GET /api/loans/:id/timeline` — Loan's full lifecycle events
+
+**Treasury:**
+- `GET /api/proposals/treasury` — Treasury proposals with vote tallies
+- `GET /api/proposals/treasury/:id/timeline` — Treasury proposal's full lifecycle events
+
+**Notifications:**
+- `GET /api/notifications?address=` — Notifications for an address
+- `PATCH /api/notifications/:id/read` — Mark one notification read (authenticated)
+- `PATCH /api/notifications/read-all?address=` — Mark all notifications read (authenticated)
+
+**Events & History:**
+- `GET /api/events` — Raw event feed (optional filters: `?symbol=`, `?contract=`, `?before=`, `?after=`, `?order=`)
+- `GET /api/interest` — Interest distribution history
+- `GET /api/documents?kind=&proposal_id=` — Proposal document attachment history
+
+**Admin:**
+- `GET /api/admin/log` — Admin/governance audit trail
+- `GET /api/admin/failed-events` — Quarantined events
+
+**Real-time:**
+- `GET /api/stream` — Server-Sent Events stream for real-time change notifications
+
+**Authentication:**
+- `GET /api/auth/challenge` — Request a nonce for signature-based authentication
+
+For detailed request/response schemas, query parameters, and authentication requirements, see the [OpenAPI specification](./openapi.json) or visit `/docs` on a running instance.
+
+**Frontend integration:** The OpenAPI spec can be used to generate type-safe client code for `ourdao-frontend`. Tools like [openapi-typescript](https://github.com/drwpow/openapi-typescript) or [openapi-generator](https://github.com/OpenAPITools/openapi-generator) can consume `openapi.json` directly to generate TypeScript types matching the API's actual response shapes, eliminating manual transcription of types from `src/types.ts`.
+
+### Common patterns
+
+All list endpoints accept `?limit=` (default 50, max 200). `?before=` and `?after=` are cursors: pass the `id` (or `ledger`) of the last row you saw to page. For `/api/events`, the cursor can be a deterministic `(ledger, id)` value and ordering is strictly deterministic (`ledger DESC, id DESC` by default, or `ASC`). 
+
+On-chain `i128` amounts are returned as decimal **strings** to preserve precision (see [Database schema](#database-schema)); ledger sequence numbers are returned as regular JSON numbers.
 
 ### Caching
 
