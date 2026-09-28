@@ -86,7 +86,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       info: {
         title: 'OurDAO Backend API',
         description: 'Off-chain indexer + read API for the OurDAO lending DAO on Stellar/Soroban',
-        version: readPackageVersion(),
+        version: packageVersionResult.version,
       },
       servers: [
         {

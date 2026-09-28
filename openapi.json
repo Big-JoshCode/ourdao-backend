@@ -9,6 +9,15 @@
     "schemas": {}
   },
   "paths": {
+    "/api/stream": {
+      "get": {
+        "responses": {
+          "200": {
+            "description": "Default Response"
+          }
+        }
+      }
+    },
     "/api/auth/challenge": {
       "get": {
         "responses": {
@@ -251,15 +260,6 @@
       }
     },
     "/api/stats": {
-      "get": {
-        "responses": {
-          "200": {
-            "description": "Default Response"
-          }
-        }
-      }
-    },
-    "/api/stream": {
       "get": {
         "responses": {
           "200": {
