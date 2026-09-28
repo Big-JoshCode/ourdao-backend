@@ -43,21 +43,22 @@ export class ReorgDetectedError extends Error {
 export async function resetForContractChange(): Promise<void> {
   const client = await pool.connect()
   try {
-    // Use pg_advisory_xact_lock instead of pg_try_advisory_lock (issue #137):
-    // pg_advisory_xact_lock is transaction-scoped and released on COMMIT,
-    // whereas pg_try_advisory_lock is session-scoped and can be left held
-    // if the process is killed between COMMIT and the explicit unlock.
-    const lockRes = await client.query<{ pg_advisory_xact_lock: boolean }>(
-      'SELECT pg_advisory_xact_lock($1)',
+    // Use pg_try_advisory_xact_lock so we fail fast if the lock is already
+    // held (e.g. a reindex or fold is in progress). pg_advisory_xact_lock
+    // blocks indefinitely; pg_try_advisory_xact_lock returns false immediately.
+    // The lock is transaction-scoped so it releases automatically on COMMIT
+    // or ROLLBACK — no explicit unlock is needed, preventing leaks on crash.
+    await client.query('BEGIN')
+    const lockRes = await client.query<{ pg_try_advisory_xact_lock: boolean }>(
+      'SELECT pg_try_advisory_xact_lock($1)',
       [REINDEX_LOCK_KEY]
     )
-    if (!lockRes.rows[0]?.pg_advisory_xact_lock) {
+    if (!lockRes.rows[0]?.pg_try_advisory_xact_lock) {
       throw new Error(
         'Cannot reset database for contract change: reindex or fold operation is currently in progress (advisory lock held)'
       )
     }
 
-    await client.query('BEGIN')
     await client.query(`TRUNCATE ${DERIVED_TABLES.join(', ')} RESTART IDENTITY`)
     await resetDaoTotals(client)
     await client.query('DELETE FROM indexer_cursor WHERE id = 1')

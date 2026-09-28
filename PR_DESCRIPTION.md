@@ -88,10 +88,10 @@ All CI checks pass:
 
 ## Dependencies Added
 
-- `@fastify/swagger` (devDependency)
-- `@fastify/swagger-ui` (devDependency)
+- `@fastify/swagger` (dependency)
+- `@fastify/swagger-ui` (dependency)
 
-Development-only dependencies for spec generation and interactive docs. No production runtime impact.
+Production dependencies for Fastify OpenAPI spec generation and interactive Swagger UI at `/docs`.
 
 ## Breaking Changes
 

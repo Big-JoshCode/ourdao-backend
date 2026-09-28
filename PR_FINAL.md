@@ -109,10 +109,10 @@ All CI checks pass:
 
 ## 📦 Dependencies Added
 
-- `@fastify/swagger` (devDependency) - OpenAPI spec generation
-- `@fastify/swagger-ui` (devDependency) - Interactive API documentation
+- `@fastify/swagger` (dependency) - OpenAPI spec generation
+- `@fastify/swagger-ui` (dependency) - Interactive API documentation at `/docs`
 
-Both are development-only; no production runtime impact.
+Runtime dependencies to serve the interactive documentation in development and production containers.
 
 ---
 
