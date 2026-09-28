@@ -108,7 +108,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
         { name: 'interest', description: 'Interest distribution history' },
       ],
     },
-  })
+  } as const)
 
   await app.register(swaggerUi, {
     routePrefix: '/docs',
@@ -116,7 +116,7 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
       docExpansion: 'list',
       deepLinking: true,
     },
-  })
+  } as const)
 
   await app.register(etag)
 
