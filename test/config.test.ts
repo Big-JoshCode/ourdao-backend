@@ -69,8 +69,15 @@ describe('resolveConfig', () => {
         streamIdleTimeoutMs: 60000,
         streamRetryAfterSeconds: 30,
         logLevel: 'info',
+        readyCheckTimeoutMs: 3000,
       },
-      db: { connectionString: undefined, nonceStore: 'postgres', poolMax: 10 },
+      db: {
+        connectionString: undefined,
+        nonceStore: 'postgres',
+        poolMax: 10,
+        statementTimeoutMs: 10000,
+        connectionTimeoutMs: 5000,
+      },
       stellar: {
         contractId: '',
         rpcUrl: 'https://soroban-testnet.stellar.org',
