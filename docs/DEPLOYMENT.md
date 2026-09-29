@@ -242,60 +242,20 @@ Both the API and the worker maintain a pool of Postgres connections. They connec
 
 The schema is applied idempotently by both processes on boot, serialized by a Postgres advisory lock. You do not need a separate migration step. Concurrent boots (e.g. a rolling deploy of the API alongside the worker restarting) are safe.
 
-## Database maintenance and growth
+### PgBouncer and LISTEN/NOTIFY incompatibility
 
-`events` is the append-only audit log and grows with DAO activity; it is never
-vacuumed away. The model in [`docs/events-storage.md`](./events-storage.md)
-projects about 4–9 KB for a full loan lifecycle, about 1.2 KB for a member join
-plus first stake, about 3 KB for an executed treasury proposal, roughly 55–60
-MB at 100,000 events, and 550–600 MB at one million events (heap and indexes).
-`notifications` also only grows. The derived tables (`members`,
-`loan_proposals`, `loans`, and `treasury_proposals`) are repeatedly updated by
-the indexer, so they accumulate dead tuples and rely on autovacuum.
+**Postgres LISTEN/NOTIFY does not work with PgBouncer in transaction pooling mode.**
 
-Postgres defaults are appropriate for a small DAO. Investigate per-table
-autovacuum tuning when dead tuples stay high between normal vacuum runs, vacuum
-falls behind a sustained write rate, or query latency rises. Start by lowering
-`autovacuum_vacuum_scale_factor` for the update-heavy derived tables and measure
-the result; do not tune the append-only `events` table on the basis of dead
-tuples alone. Keep enough free disk for index rebuilds and vacuum work.
+PgBouncer's transaction pooling mode reassigns backend connections per transaction. LISTEN is per-connection state, so subscriptions issued on connection A are silently lost when the next transaction runs on connection B. The SSE stream (`/api/stream`) relies on LISTEN/NOTIFY to deliver real-time change notifications; with PgBouncer in transaction mode, notifications are never delivered—clients receive only heartbeats.
 
-Run these from `psql` during normal operation:
+**If using PgBouncer:**
+1. **Recommended**: Use **session pooling mode** instead of transaction mode for the API process. The worker can still go through PgBouncer in transaction mode (it doesn't use LISTEN/NOTIFY).
+2. **Alternative**: Point the API's `DATABASE_URL` directly at Postgres, bypassing PgBouncer entirely. The indexer can still go through PgBouncer.
+3. **Polling only**: Deploy without SSE—clients poll instead. The REST API works through PgBouncer in transaction mode without restriction.
 
-```sql
--- Heap, indexes, and total footprint for the service tables.
-SELECT relname AS table_name,
-       pg_size_pretty(pg_table_size(relid)) AS table_size,
-       pg_size_pretty(pg_indexes_size(relid)) AS indexes_size,
-       pg_size_pretty(pg_total_relation_size(relid)) AS total_size
-FROM pg_catalog.pg_statio_user_tables
-ORDER BY pg_total_relation_size(relid) DESC;
+Session pooling sacrifices PgBouncer's primary scaling benefit (connection reuse), but the shared listener model (issue #152) means each API instance holds only one extra LISTEN connection regardless of connected client count—PgBouncer's value here is limited. For most deployments, bypassing PgBouncer for the API is simplest.
 
--- Dead tuples and the last vacuum/analyze activity.
-SELECT relname, n_live_tup, n_dead_tup, last_autovacuum, last_autoanalyze,
-       vacuum_count, autovacuum_count
-FROM pg_stat_user_tables
-WHERE relname IN ('members', 'loan_proposals', 'loans', 'treasury_proposals', 'notifications', 'events')
-ORDER BY n_dead_tup DESC;
-
--- Long-running transactions can delay vacuum cleanup.
-SELECT pid, usename, now() - xact_start AS transaction_age, state, query
-FROM pg_stat_activity
-WHERE xact_start IS NOT NULL
-ORDER BY xact_start;
-```
-
-`npm run reindex` takes the indexer advisory lock, truncates and rewrites every
-derived table, and commits that work as one transaction. Its duration grows
-with the event log (roughly 3–8 seconds at 100k events, 40–90 seconds at 1M,
-and 4–8 minutes at 5M in the storage model). During it, derived-state reads can
-be stale or blocked, the worker cannot fold events, and the open transaction
-can hold cleanup horizons that delay autovacuum. Schedule it as maintenance,
-monitor its transaction age, and let it finish before making vacuum/bloat
-judgements. A rewrite restores the derived-table heap layout, but indexes can
-still need a separately planned `REINDEX` if monitoring shows bloat; use
-`REINDEX CONCURRENTLY` where your PostgreSQL version and operational window
-allow it.
+See [`docs/REALTIME-NOTIFICATIONS.md`](./REALTIME-NOTIFICATIONS.md) for the full SSE/LISTEN/NOTIFY architecture and why this incompatibility exists.
 
 ---
 
