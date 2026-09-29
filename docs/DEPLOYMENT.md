@@ -12,9 +12,15 @@ This document covers everything needed to run `ourdao-backend` outside a laptop:
 - [Required configuration](#required-configuration)
 - [Full configuration reference](#full-configuration-reference)
 - [Database connections](#database-connections)
+- [Database credential rotation](#database-credential-rotation)
+- [Database maintenance and growth](#database-maintenance-and-growth)
 - [Backup and recovery](#backup-and-recovery)
+- [Release management and migrations](#release-management-and-migrations)
+- [Rolling back a bad deploy](#rolling-back-a-bad-deploy)
+- [Container security and image scanning](#container-security-and-image-scanning)
 - [Redeploying the contract](#redeploying-the-contract)
 - [Operations](#operations)
+- [Soroban RPC wire smoke testing](#soroban-rpc-wire-smoke-testing)
 - [Related repos](#related-repos)
 
 ---
@@ -119,6 +125,48 @@ Set this to the specific contract id this deployment indexes. If `CONTRACT_ID` d
 
 Postgres connection string, e.g. `postgres://user:password@host:5432/dbname`. Alternatively set the individual `PGHOST`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE` variables. Both processes read the same database.
 
+### Database credential rotation
+
+`DATABASE_URL` is read when a process starts. Existing pooled connections keep
+using the old credential, so changing an environment variable alone does not
+rotate a running API or worker. `NONCE_STORE=postgres` uses this same database
+pool on authenticated notification requests; it has no separate secret, but
+those requests are unavailable during an API restart just like every other API
+request.
+
+The lowest-risk procedure is a short, controlled restart. Create the new
+database role/password, update `DATABASE_URL` (or the individual `PG*`
+variables) for **both** process definitions, then restart the worker and API.
+
+1. If the worker is draining a page, let its clean shutdown finish first. It
+   waits up to ten seconds for the current page transaction; do not start its
+   replacement until the old worker has stopped, because the worker must remain
+   a singleton. If a migration is running on boot, let that boot finish rather
+   than terminating it midway.
+2. Start the replacement worker once. Both entrypoints run idempotent migrations
+   on boot behind a Postgres advisory lock, so a rotation restart may wait for
+   an already-running migration, but it cannot run a competing migration.
+3. Roll API instances one at a time. Drain or close any open SSE clients on an
+   instance before stopping it, then start the replacement and wait for
+   `/ready`. Current releases fan SSE clients out from one dedicated LISTEN
+   connection per API process, rather than allocating a database connection per
+   client; nevertheless SSE sockets are long-lived and must be closed or
+   drained deliberately when retiring an instance.
+4. Verify the worker advances `lastIndexedLedger`, API `/ready` is healthy, and
+   an authenticated notification request works when `NONCE_STORE=postgres`.
+   Revoke the old credential only after no old process remains connected.
+
+This causes up to the worker's clean-drain time (normally seconds) and each API
+instance's restart time. A multi-instance API remains available during a rolling
+restart; a singleton API has a brief outage. For no credential-induced API
+downtime, create an overlapping database credential, deploy it to new API
+instances and the replacement worker, verify them, then revoke the old one.
+The worker still requires a stop-before-start handoff, so indexing pauses for
+that handoff but API reads continue. There are no other application-managed
+secrets in this deployment surface: `CONTRACT_ID`, RPC URL, network passphrase,
+and CORS origin are identifiers/configuration, while wallet signatures are
+provided per request and never stored as a deploy-time secret.
+
 ### `CORS_ORIGIN`
 
 **Defaults to `http://localhost:3000`.** In production, set this to the deployed frontend's origin (e.g. `https://app.ourdao.xyz`). If left at the default, the browser will block every cross-origin request from the real frontend — the API will appear to work from `curl` and fail silently in the browser.
@@ -157,6 +205,10 @@ All configuration is environment-driven. See [`.env.example`](../.env.example) f
 | `NETWORK_PASSPHRASE` | testnet | **Set to mainnet passphrase for mainnet deployments.** |
 | `DATABASE_URL` | _(none)_ | Postgres connection string. |
 | `DB_POOL_MAX` | `10` | Per-instance request pool size. See [Database connections](#database-connections) — `/api/stream` no longer needs headroom here (issue #152). |
+| `DB_CONNECTION_TIMEOUT_MS` | `5000` | How long a caller waits for a free pooled connection before failing (issue #167). |
+| `DB_STATEMENT_TIMEOUT_MS` | `10000` | Server-side `statement_timeout` for pooled connections. `0` disables. Reindex and migrations exempt themselves. |
+| `DB_IDLE_TIMEOUT_MS` | `30000` | Idle pooled connections are closed after this long. `0` disables eviction. |
+| `DB_APPLICATION_NAME` | `ourdao-api` / `ourdao-worker` | `pg_stat_activity.application_name`. Leave unset so each process names itself. |
 | `NONCE_STORE` | `postgres` | Keep `postgres` for multi-instance API. |
 | `START_LEDGER` | `0` | **Set to the contract's deploy ledger on first boot.** See above. |
 | `START_LOOKBACK_LEDGERS` | `17280` | Used only when `START_LEDGER=0`. |
@@ -172,6 +224,8 @@ All configuration is environment-driven. See [`.env.example`](../.env.example) f
 | `RATE_LIMIT_WINDOW_MS` | `60000` | Rate limit window (ms). |
 | `RATE_LIMIT_EVENTS_MAX` | `30` | Stricter limit for `GET /api/events`. |
 | `STATS_CACHE_MS` | `5000` | In-process cache TTL for `/api/stats`. `0` disables. |
+| `STATS_MAX_CONCURRENT` | `1` | Per-process cap for uncached stats recomputations; excess requests get `503`. |
+| `STATS_RETRY_AFTER_SECONDS` | `1` | Retry delay sent with a shed stats response. |
 | `TRUST_PROXY` | `false` | **Set to `true` behind a reverse proxy.** |
 
 ---
@@ -182,6 +236,8 @@ Both the API and the worker maintain a pool of Postgres connections. They connec
 
 - **Worker**: one long-running poller with modest concurrency. The pool is used for migrations on boot, then for a rolling sequence of per-page transactions. A pool size of 2–5 is typically sufficient.
 - **API**: stateless and horizontally scalable. Each instance maintains its own pool, sized via `DB_POOL_MAX` (default 10, `pg`'s own default made explicit). Pool size depends on expected *request* query concurrency only — `/api/stream` does **not** add to it: each instance keeps exactly one extra long-lived connection for its shared SSE listener, regardless of how many browser tabs are connected to that instance (issue #152 — a per-client connection here used to let ten concurrent streams alone exhaust the whole request pool).
+- **Timeouts** (all in ms, all environment-driven): `DB_CONNECTION_TIMEOUT_MS` bounds the wait for a free connection (default 5000 — an exhausted pool fails rather than hangs); `DB_STATEMENT_TIMEOUT_MS` is a server-side per-statement limit (default 10000); `DB_IDLE_TIMEOUT_MS` closes idle connections (default 30000). `npm run reindex` and migrations lift the statement timeout for their own transaction/session only.
+- **Telling processes apart**: each process sets `application_name` — `ourdao-api`, `ourdao-worker`, `ourdao-api-listener` (the SSE listener), and `ourdao-reindex` while a rebuild runs — so `SELECT application_name, count(*) FROM pg_stat_activity GROUP BY 1` shows who holds what. Set `DB_APPLICATION_NAME` only if you need a custom name and give the API and worker different values.
 - **Total connections**: `worker_pool + (api_instances × (DB_POOL_MAX + 1))` must fit within Postgres's `max_connections` (the `+ 1` per instance is its stream listener). The default is 100; budget accordingly, or use a connection pooler (PgBouncer, RDS Proxy) if you scale API instances beyond a handful.
 
 The schema is applied idempotently by both processes on boot, serialized by a Postgres advisory lock. You do not need a separate migration step. Concurrent boots (e.g. a rolling deploy of the API alongside the worker restarting) are safe.
@@ -241,6 +297,64 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 ### The `events` log is append-only
 
 `events` rows are never mutated or deleted by normal operation. This is an architectural invariant, not just a convention — it is what makes `reindex` reliable. Do not write application code that modifies existing `events` rows. If an event was incorrectly decoded, fix the decoder and reindex; do not patch the raw row.
+
+---
+
+## Release management and migrations
+
+Before deploying an image upgrade or pulling a new release, operators must consult [CHANGELOG.md](../CHANGELOG.md).
+
+Releases follow [Semantic Versioning](https://semver.org/). Each release entry in the changelog explicitly flags operational prerequisites:
+- **`[Migration: <file>]`** — Release carries one or more database migrations. Schema migrations run automatically on boot (serialized by a Postgres advisory lock), but operators should be aware of additions or table alterations before rollout.
+- **`[Requires Reindex]`** — Release alters event folding logic, fixes a previous event decoding defect, or backfills derived tables. After starting the new version, operators must run `npm run reindex` (or `docker run --env-file .env ourdao-backend node dist/indexer/reindex.js`) to re-sync derived tables with the raw event log.
+
+The `/version` endpoint reports the active build's version, commit sha, and build date:
+```bash
+curl http://localhost:4000/version
+# {"version":"0.2.0","commit":"...","buildDate":"..."}
+```
+
+### Migration policy: forward-only, backward-compatible
+
+Migrations have **no down path**. Instead, every migration must be **backward-compatible with the previous application release**: the image that ran before this one must keep working against the schema this one leaves behind. In practice that means additive changes only (new nullable or defaulted columns, new tables, new indexes) and *expand/contract* for anything else — a rename, type change, drop or tighter constraint ships as an additive step in one release and the destructive step in a later release, once no running image depends on the old shape.
+
+Each file under `src/db/migrations/` declares this on its first line (`-- compat: backward-compatible` or `-- compat: breaking (<reason>)`), and `test/migration-policy.test.ts` fails on a missing annotation or on a destructive statement (`DROP COLUMN`, `RENAME`, `ALTER COLUMN … TYPE`, `SET NOT NULL`, `ADD CONSTRAINT`, …) in a file annotated compatible. CONTRIBUTING's "Schema changes" makes this a review requirement.
+
+## Rolling back a bad deploy
+
+Migrations run automatically on boot, so starting the previous image does **not** undo the schema — the database stays at the newer version. Rolling back the image is safe exactly when every migration applied since that image's release is backward-compatible.
+
+**Procedure**
+
+1. Stop the new **worker** first (it is a singleton — see [The worker must be a singleton](#the-worker-must-be-a-singleton)), then the API instances.
+2. Check which migrations the bad release applied: `SELECT version, name, applied_at FROM schema_migrations ORDER BY version DESC;` and compare against the previous release's `src/db/migrations/` (each release entry in [CHANGELOG.md](../CHANGELOG.md) carries a `[Migration: <file>]` flag).
+3. If **none** of those migrations is listed as breaking below, start the previous image (worker, then API). It boots against the newer schema and runs unchanged. Do not delete rows from `schema_migrations`.
+4. If the release applied **any breaking migration**, do not simply roll the image back — see the table. Either roll *forward* with a fix, or restore the database (see [Backup and recovery](#backup-and-recovery): the `events` log is the only irreplaceable data, and derived tables can be rebuilt with `npm run reindex` after restoring).
+5. If the bad release changed folding logic and wrote wrong derived rows before you rolled back, run `npm run reindex` on the restored/previous image (worker stopped).
+
+**Audit of existing migrations** (against the rule above; the annotations in the files are the source of truth)
+
+| Migration | Verdict | Consequence of rolling back past it |
+|---|---|---|
+| `0001_widen_vote_columns` | **breaking** — `INTEGER` → `NUMERIC(40,0)` | A release that predates it reads `votes_*` as numbers; the column now returns strings. Never roll back past it. |
+| `0012_status_check_constraints` | **breaking** — adds `CHECK`s | A release that predates it can no longer write a status outside the set; constraints stay. |
+| `0017_approved_pending_disbursement_status` | **breaking** — widens the status `CHECK` | Rows may hold `approved_pending_disbursement`, which a release predating it does not handle. Reindex is not enough if it has already folded such rows; roll forward. |
+| `0022_failed_events_uniqueness` | **breaking** — `UNIQUE(event_id)` | A release predating it inserts into `failed_events` without `ON CONFLICT`, so a repeat failure of the same event errors on the quarantine path. |
+| all others (`0002`–`0010`, `0013`, `0015`, `0016`, `0018`–`0021`, `0023`) | backward-compatible | Additive columns/tables/indexes; safe to roll back across. |
+
+Versions `0011` and `0014` are unused (gaps are allowed; see the loader in `src/db/migrate.ts`).
+
+---
+
+## Container security and image scanning
+
+To guarantee build reproducibility and protect the production environment against base-image vulnerabilities:
+
+- **Pinned Digest Base Image**: The `Dockerfile` pins the base image by immutable SHA256 digest (`node:20-alpine@sha256:...`) rather than a mutable floating tag. Dependabot monitors Docker ecosystem updates weekly and opens PRs when updated digests are available.
+- **Vulnerability Scanning**: In CI, the `docker-build` job automatically scans the built container image with Trivy.
+- **Failure Policy**: Builds fail on any detected `HIGH` or `CRITICAL` severity vulnerability with available fixes.
+- **Allowlist Policy**: If an upstream vulnerability cannot yet be patched or represents an acceptable risk, it must be documented in [`.trivyignore`](../.trivyignore) including the CVE ID, explanation, upstream tracking link, and an expiration date.
+- **Job Summary Reporting**: Detailed scan tables are published directly to the GitHub Actions Job Summary on every run.
 
 ---
 
@@ -343,6 +457,49 @@ docker run --env-file .env ourdao-backend node dist/indexer/reindex.js
 ```
 
 This is safe to run at any time — it is idempotent and the result is always consistent with the raw log. It is the recovery path for reorgs, quarantined events (after fixing the handler), and any derived-table corruption. See [`docs/events-storage.md`](./events-storage.md) for expected run times at various log sizes.
+
+---
+
+## Soroban RPC wire smoke testing
+
+To verify that `@stellar/stellar-sdk` and the event catalog continue to match the actual wire format returned by Soroban RPC without depending on fixtures, an opt-in smoke test is provided in `test/soroban-rpc-smoke.test.ts`.
+
+This test does not run during regular pull requests to avoid public RPC latency or rate-limiting from blocking CI, but runs on a scheduled CI workflow and can be triggered on demand.
+
+### Running against a live testnet contract
+```bash
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=C... \
+SOROBAN_RPC_URL=https://soroban-testnet.stellar.org \
+npm run test:smoke
+```
+
+### Running against a local standalone network
+To smoke test in an isolated offline environment using Stellar's official standalone container:
+
+```bash
+# 1. Start local standalone network with Soroban RPC enabled
+docker run --rm -d \
+  -p 8000:8000 \
+  --name stellar-standalone \
+  stellar/quickstart:testing \
+  --standalone \
+  --enable-soroban-rpc
+
+# 2. Wait for RPC readiness
+curl -s -X POST http://localhost:8000/soroban/rpc \
+  -H "Content-Type: application/json" \
+  -d '{"jsonrpc":"2.0","id":1,"method":"getHealth"}'
+
+# 3. Deploy/invoke the contract or pass your deployed test contract id
+RUN_RPC_SMOKE=true \
+CONTRACT_ID=<DEPLOYED_CONTRACT_ID> \
+SOROBAN_RPC_URL=http://localhost:8000/soroban/rpc \
+npm run test:smoke
+
+# 4. Tear down container
+docker stop stellar-standalone
+```
 
 ---
 

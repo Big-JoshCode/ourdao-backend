@@ -64,6 +64,8 @@ describe('resolveConfig', () => {
         rateLimitEventsMax: 30,
         trustProxy: 'false',
         statsCacheMs: 5000,
+        statsMaxConcurrent: 1,
+        statsRetryAfterSeconds: 1,
         streamMaxConnections: 100,
         streamMaxConnectionsPerIp: 10,
         streamIdleTimeoutMs: 60000,
