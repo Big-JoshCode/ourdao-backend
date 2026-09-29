@@ -773,6 +773,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       last_ledger: number | null
       observed_tip_ledger: number | null
       cursor_updated_at: string | null
+      quarantine_escalated_at: string | null
     }>(
       // Member counts mirror the contract's two distinct getters:
       // get_total_members (all-time) vs get_active_members (current). Both
@@ -798,7 +799,8 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
          (SELECT count(*) FROM failed_events WHERE resolved_at IS NULL)            AS quarantined_events,
          (SELECT last_ledger FROM indexer_cursor WHERE id = 1)                     AS last_ledger,
          (SELECT observed_tip_ledger FROM indexer_cursor WHERE id = 1)             AS observed_tip_ledger,
-         (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at`
+         (SELECT updated_at FROM indexer_cursor WHERE id = 1)                      AS cursor_updated_at,
+         (SELECT escalated_at FROM quarantine_state WHERE id = 1)                  AS quarantine_escalated_at`
     )
     const cursorUpdatedAt = row?.cursor_updated_at
     const secondsSinceUpdate = cursorUpdatedAt
@@ -833,6 +835,7 @@ export async function registerRoutes(app: FastifyInstance, opts: { nonceStore: N
       principalRepaid: String(row?.principal_repaid ?? '0'),
       valueDefaulted: String(row?.value_defaulted ?? '0'),
       quarantinedEvents: Number(row?.quarantined_events ?? 0),
+      quarantineEscalatedAt: row?.quarantine_escalated_at ?? null,
       lastIndexedLedger: lastLedger,
       observedTipLedger: tipLedger,
       ledgersBehind,
