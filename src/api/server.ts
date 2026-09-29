@@ -3,6 +3,8 @@ import { randomUUID } from 'node:crypto'
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import etag from '@fastify/etag'
+import swagger from '@fastify/swagger'
+import swaggerUi from '@fastify/swagger-ui'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
 import { registerErrorHandling } from './errors.js'
@@ -77,6 +79,44 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   } else {
     nonceStore = new MemoryNonceStore()
   }
+
+  // ── OpenAPI / Swagger (issue #215) ──
+  await app.register(swagger, {
+    openapi: {
+      info: {
+        title: 'OurDAO Backend API',
+        description: 'Off-chain indexer + read API for the OurDAO lending DAO on Stellar/Soroban',
+        version: packageVersionResult.version,
+      },
+      servers: [
+        {
+          url: 'http://localhost:4000',
+          description: 'Development server',
+        },
+      ],
+      tags: [
+        { name: 'health', description: 'Service health and readiness endpoints' },
+        { name: 'stats', description: 'Aggregate statistics' },
+        { name: 'members', description: 'DAO member operations' },
+        { name: 'loans', description: 'Loan and loan proposal operations' },
+        { name: 'treasury', description: 'Treasury proposal operations' },
+        { name: 'notifications', description: 'Member notifications' },
+        { name: 'events', description: 'Raw event feed' },
+        { name: 'admin', description: 'Admin and governance operations' },
+        { name: 'auth', description: 'Authentication operations' },
+        { name: 'documents', description: 'Proposal document attachments' },
+        { name: 'interest', description: 'Interest distribution history' },
+      ],
+    },
+  } as const)
+
+  await app.register(swaggerUi, {
+    routePrefix: '/docs',
+    uiConfig: {
+      docExpansion: 'list',
+      deepLinking: true,
+    },
+  } as const)
 
   await app.register(etag)
 
