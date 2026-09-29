@@ -186,6 +186,21 @@ Both the API and the worker maintain a pool of Postgres connections. They connec
 
 The schema is applied idempotently by both processes on boot, serialized by a Postgres advisory lock. You do not need a separate migration step. Concurrent boots (e.g. a rolling deploy of the API alongside the worker restarting) are safe.
 
+### PgBouncer and LISTEN/NOTIFY incompatibility
+
+**Postgres LISTEN/NOTIFY does not work with PgBouncer in transaction pooling mode.**
+
+PgBouncer's transaction pooling mode reassigns backend connections per transaction. LISTEN is per-connection state, so subscriptions issued on connection A are silently lost when the next transaction runs on connection B. The SSE stream (`/api/stream`) relies on LISTEN/NOTIFY to deliver real-time change notifications; with PgBouncer in transaction mode, notifications are never delivered—clients receive only heartbeats.
+
+**If using PgBouncer:**
+1. **Recommended**: Use **session pooling mode** instead of transaction mode for the API process. The worker can still go through PgBouncer in transaction mode (it doesn't use LISTEN/NOTIFY).
+2. **Alternative**: Point the API's `DATABASE_URL` directly at Postgres, bypassing PgBouncer entirely. The indexer can still go through PgBouncer.
+3. **Polling only**: Deploy without SSE—clients poll instead. The REST API works through PgBouncer in transaction mode without restriction.
+
+Session pooling sacrifices PgBouncer's primary scaling benefit (connection reuse), but the shared listener model (issue #152) means each API instance holds only one extra LISTEN connection regardless of connected client count—PgBouncer's value here is limited. For most deployments, bypassing PgBouncer for the API is simplest.
+
+See [`docs/REALTIME-NOTIFICATIONS.md`](./REALTIME-NOTIFICATIONS.md) for the full SSE/LISTEN/NOTIFY architecture and why this incompatibility exists.
+
 ---
 
 ## Backup and recovery

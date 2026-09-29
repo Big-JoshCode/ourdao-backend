@@ -42,12 +42,16 @@ This repository is one of three that make up OurDAO:
 
 ```
 Soroban RPC ──getEvents──▶ indexer (worker.ts) ──▶ Postgres ──▶ REST API (index.ts) ──▶ frontend
+                                                       │
+                                                       │ LISTEN/NOTIFY (real-time)
+                                                       └──────▶ SSE (/api/stream) ──▶ frontend
 ```
 
-- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor (`indexer_cursor` table) rather than re-scanning from genesis on every restart. Each raw event is written to an append-only `events` log, then folded into the relevant derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction, so a crash mid-poll can never leave the derived tables and the raw log inconsistent. Poll failures back off exponentially (capped, configurable) instead of hammering the RPC endpoint. The `events` log is never pruned; its growth per unit of DAO activity, the secondary-index costs, and the point at which partitioning becomes worthwhile are documented in [`docs/events-storage.md`](./docs/events-storage.md) (measure with `npm run bench:events`).
+- **`src/indexer`** — a poll loop over the Soroban RPC `getEvents`, resuming from a persisted cursor (`indexer_cursor` table) rather than re-scanning from genesis on every restart. Each raw event is written to an append-only `events` log, then folded into the relevant derived table (`members`, `loan_proposals`, `loans`, `treasury_proposals`, `notifications`) inside a single database transaction, so a crash mid-poll can never leave the derived tables and the raw log inconsistent. After each successful fold, the indexer sends a Postgres NOTIFY to alert connected clients of the change. Poll failures back off exponentially (capped, configurable) instead of hammering the RPC endpoint. The `events` log is never pruned; its growth per unit of DAO activity, the secondary-index costs, and the point at which partitioning becomes worthwhile are documented in [`docs/events-storage.md`](./docs/events-storage.md) (measure with `npm run bench:events`).
 - **`src/stellar/events.ts`** — the event catalog: the exact topic-symbol → data-tuple mapping the contract publishes, decoded via `scValToNative` and converted to JSON-safe primitives (bigints become strings, since JSON has no native 128-bit integer type).
-- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints in the [API reference](#api-reference) below.
+- **`src/api`** — a [Fastify](https://fastify.dev) server exposing the read endpoints in the [API reference](#api-reference) below. Includes both request/response REST routes and a Server-Sent Events (SSE) stream at `/api/stream` for real-time notifications.
 - **`src/db`** — the Postgres schema (applied idempotently on boot by both the API and worker processes) and a thin query helper over [`pg`](https://node-postgres.com/).
+- **Real-time notifications** — the indexer and API processes communicate through Postgres LISTEN/NOTIFY. After each fold transaction commits, a NOTIFY fires, which the API's shared listener receives and fans out to connected SSE clients. This message-passing topology is documented in detail in [`docs/REALTIME-NOTIFICATIONS.md`](./docs/REALTIME-NOTIFICATIONS.md), including delivery guarantees, connection costs, and PgBouncer incompatibility.
 
 The API process and the indexer worker are separate entrypoints (`index.ts` / `worker.ts`) so they can be scaled or deployed independently — e.g. one long-running indexer worker behind several stateless, horizontally-scaled API instances.
 

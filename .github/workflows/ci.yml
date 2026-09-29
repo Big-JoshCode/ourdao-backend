@@ -54,6 +54,9 @@ jobs:
       - name: OpenAPI spec is up to date
         run: npm run openapi:validate
 
+      - name: License check
+        run: npm run license:check
+
       # Runs the full suite with v8 coverage instrumentation and enforces the
       # thresholds in vitest.config.ts (#79). Replaces the plain `npm test`
       # step — same tests, plus the report. Observed runtime delta on CI: a
@@ -122,6 +125,21 @@ jobs:
           build-args: |
             SOURCE_COMMIT=${{ github.sha }}
             BUILD_DATE=${{ github.event.repository.updated_at }}
+          # Issue #219: generate SBOM covering base image + npm dependencies
+          sbom: true
+          provenance: false
+
+      - name: Extract SBOM
+        run: |
+          docker buildx imagetools inspect "$IMAGE" --format '{{json .SBOM}}' > sbom.json
+          echo "SBOM artifact generated: sbom.json ($(wc -c < sbom.json) bytes)"
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ github.sha }}
+          path: sbom.json
+          retention-days: 90
 
       # The `cp src/db/schema.sql … && cp -r src/db/migrations …` build step is
       # the failure most likely to reach production silently: add a migration,
