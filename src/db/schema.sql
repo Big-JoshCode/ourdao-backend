@@ -300,3 +300,25 @@ CREATE TABLE IF NOT EXISTS auth_nonces (
 );
 CREATE INDEX IF NOT EXISTS auth_nonces_expires_at_idx ON auth_nonces (expires_at);
 CREATE INDEX IF NOT EXISTS auth_nonces_address_idx ON auth_nonces (address);
+
+-- Immutable audit trail for administrative actions (issue #291): resolving
+-- quarantined events, resetting cursors, manual reindexing. Rows are never
+-- updated or deleted — append-only so the trail is tamper-evident.
+-- `admin_address` is the authenticated Stellar address that performed the action.
+-- `action` is a short machine-readable label (e.g. 'resolve_quarantined_event').
+-- `ip_address` is the originating IP as seen by the API (trust level depends on
+--   TRUST_PROXY configuration).
+-- `payload` stores action-specific context as JSONB so the schema is stable as
+--   new action types are added.
+CREATE TABLE IF NOT EXISTS admin_audit_log (
+  id            BIGSERIAL PRIMARY KEY,
+  admin_address TEXT NOT NULL,
+  action        TEXT NOT NULL,
+  ip_address    TEXT,
+  payload       JSONB NOT NULL DEFAULT '{}',
+  created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS admin_audit_log_admin_address_idx ON admin_audit_log (admin_address, created_at DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_action_idx ON admin_audit_log (action, created_at DESC);
+CREATE INDEX IF NOT EXISTS admin_audit_log_created_at_idx ON admin_audit_log (created_at DESC);

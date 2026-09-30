@@ -202,6 +202,26 @@ export interface FailedEventRow {
   resolution_note: string | null
 }
 
+// Issue #291: machine-readable labels for every admin action type that is
+// written to admin_audit_log. Append-only — never rename or remove a value,
+// since existing rows in the database reference these strings.
+export const ADMIN_AUDIT_ACTIONS = [
+  'resolve_quarantined_event',
+  'reset_cursor',
+  'manual_reindex',
+] as const
+
+export type AdminAuditAction = (typeof ADMIN_AUDIT_ACTIONS)[number]
+
+export interface AdminAuditLogRow {
+  id: number
+  admin_address: string
+  action: AdminAuditAction | string  // string fallback for future actions not yet in the enum
+  ip_address: string | null
+  payload: Record<string, unknown>
+  created_at: string
+}
+
 export interface DAOStats {
   totalMembers: number
   activeMembers: number
