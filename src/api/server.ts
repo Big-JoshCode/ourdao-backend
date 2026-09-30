@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance, type FastifyServerOptions } from 'fastify'
 import { randomUUID } from 'node:crypto'
+import type { ServerOptions } from 'node:http'
 import cors from '@fastify/cors'
 import rateLimit from '@fastify/rate-limit'
 import etag from '@fastify/etag'
@@ -8,7 +9,7 @@ import swaggerUi from '@fastify/swagger-ui'
 import { config } from '../config.js'
 import { pool } from '../db/index.js'
 import { registerCachePolicy } from './cache-policy.js'
-import { registerErrorHandling } from './errors.js'
+import { clientErrorHandler, frameworkErrors, registerErrorHandling } from './errors.js'
 import { registerRoutes } from './routes/index.js'
 import { MemoryNonceStore, PostgresNonceStore, type NonceStore } from '../auth.js'
 import { readFileSync } from 'fs'
@@ -50,7 +51,19 @@ export interface BuildServerOptions {
    * failure's full detail (and its correlation id) reach the log.
    */
   logger?: FastifyServerOptions['logger']
+  /**
+   * Extra Fastify options, applied last. Tests use it to shrink the server
+   * timeouts (issue #187) to something a test can wait out.
+   */
+  serverOptions?: Partial<FastifyServerOptions> & { http?: ServerOptions }
 }
+
+/**
+ * Longest path parameter the router accepts (Fastify's default, pinned —
+ * issue #187). The longest legitimate one is a 56-character Stellar `G…`
+ * address in `/members/:address`; ids are integers. Longer values get a 414.
+ */
+export const MAX_PARAM_LENGTH = 100
 
 export async function buildServer(opts: BuildServerOptions = {}): Promise<FastifyInstance> {
   const app = Fastify({
@@ -59,6 +72,15 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
     // The request id doubles as the error-envelope correlation id (issue #81),
     // so make it a random uuid rather than the default per-process counter.
     genReqId: () => randomUUID(),
+    // Issue #187: explicit limits instead of inherited defaults (see config.ts).
+    bodyLimit: config.http.bodyLimitBytes,
+    requestTimeout: config.http.requestTimeoutMs,
+    connectionTimeout: config.http.connectionTimeoutMs,
+    keepAliveTimeout: config.http.keepAliveTimeoutMs,
+    routerOptions: { maxParamLength: MAX_PARAM_LENGTH },
+    clientErrorHandler,
+    frameworkErrors,
+    ...opts.serverOptions,
   })
 
   // One error shape for every failure — installed before routes so every child
@@ -85,6 +107,44 @@ export async function buildServer(opts: BuildServerOptions = {}): Promise<Fastif
   app.addHook('onClose', async () => {
     await nonceStore.shutdown()
   })
+
+  // ── OpenAPI / Swagger (issue #215) ──
+  await app.register(swagger, {
+    openapi: {
+      info: {
+        title: 'OurDAO Backend API',
+        description: 'Off-chain indexer + read API for the OurDAO lending DAO on Stellar/Soroban',
+        version: packageVersionResult.version,
+      },
+      servers: [
+        {
+          url: 'http://localhost:4000',
+          description: 'Development server',
+        },
+      ],
+      tags: [
+        { name: 'health', description: 'Service health and readiness endpoints' },
+        { name: 'stats', description: 'Aggregate statistics' },
+        { name: 'members', description: 'DAO member operations' },
+        { name: 'loans', description: 'Loan and loan proposal operations' },
+        { name: 'treasury', description: 'Treasury proposal operations' },
+        { name: 'notifications', description: 'Member notifications' },
+        { name: 'events', description: 'Raw event feed' },
+        { name: 'admin', description: 'Admin and governance operations' },
+        { name: 'auth', description: 'Authentication operations' },
+        { name: 'documents', description: 'Proposal document attachments' },
+        { name: 'interest', description: 'Interest distribution history' },
+      ],
+    },
+  } as const)
+
+  await app.register(swaggerUi, {
+    routePrefix: '/docs',
+    uiConfig: {
+      docExpansion: 'list',
+      deepLinking: true,
+    },
+  } as const)
 
   await app.register(etag)
   // Registered after etag so its onSend sees the final headers (issue #194).

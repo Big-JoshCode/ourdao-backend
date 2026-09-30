@@ -227,6 +227,10 @@ All configuration is environment-driven. See [`.env.example`](../.env.example) f
 | `STATS_MAX_CONCURRENT` | `1` | Per-process cap for uncached stats recomputations; excess requests get `503`. |
 | `STATS_RETRY_AFTER_SECONDS` | `1` | Retry delay sent with a shed stats response. |
 | `TRUST_PROXY` | `false` | **Set to `true` behind a reverse proxy.** |
+| `HTTP_BODY_LIMIT_BYTES` | `16384` | Max request body; larger bodies get `413 PAYLOAD_TOO_LARGE`. The API is read-only, so there is rarely a reason to raise it. |
+| `HTTP_REQUEST_TIMEOUT_MS` | `30000` | Max time to receive a complete request (headers + body); a stalled request gets `408 REQUEST_TIMEOUT` and the socket is closed. Node checks this every 30s, so a stalled request is closed within this value + 30s. Does not limit response time — SSE streams are unaffected. `0` disables. |
+| `HTTP_CONNECTION_TIMEOUT_MS` | `60000` | Socket inactivity timeout. Keep it above the 30s SSE heartbeat. `0` disables. |
+| `HTTP_KEEP_ALIVE_TIMEOUT_MS` | `72000` | Idle keep-alive timeout. **Keep it above your load balancer's idle timeout** (e.g. 60s on AWS ALB), or the LB may reuse a socket the server just closed and return `502`. |
 
 ---
 
@@ -239,6 +243,26 @@ Both the API and the worker maintain a pool of Postgres connections. They connec
 - **Timeouts** (all in ms, all environment-driven): `DB_CONNECTION_TIMEOUT_MS` bounds the wait for a free connection (default 5000 — an exhausted pool fails rather than hangs); `DB_STATEMENT_TIMEOUT_MS` is a server-side per-statement limit (default 10000); `DB_IDLE_TIMEOUT_MS` closes idle connections (default 30000). `npm run reindex` and migrations lift the statement timeout for their own transaction/session only.
 - **Telling processes apart**: each process sets `application_name` — `ourdao-api`, `ourdao-worker`, `ourdao-api-listener` (the SSE listener), and `ourdao-reindex` while a rebuild runs — so `SELECT application_name, count(*) FROM pg_stat_activity GROUP BY 1` shows who holds what. Set `DB_APPLICATION_NAME` only if you need a custom name and give the API and worker different values.
 - **Total connections**: `worker_pool + (api_instances × (DB_POOL_MAX + 1))` must fit within Postgres's `max_connections` (the `+ 1` per instance is its stream listener). The default is 100; budget accordingly, or use a connection pooler (PgBouncer, RDS Proxy) if you scale API instances beyond a handful.
+
+### Where SSE clients fit in the budget
+
+Open `/api/stream` clients do **not** appear in the connection formula above, and that is deliberate — not an omission:
+
+- **Per instance, streams cost exactly one Postgres connection in total** (the shared `ourdao-api-listener` session), whether one tab or `STREAM_MAX_CONNECTIONS` tabs are connected. They never check out a connection from the `DB_POOL_MAX` request pool, so no number of concurrent streams can starve ordinary queries.
+- **The hard per-instance limit on streams is `STREAM_MAX_CONNECTIONS`** (default 100; `STREAM_MAX_CONNECTIONS_PER_IP`, default 10, per client IP). Past it a new stream gets `503 SERVICE_UNAVAILABLE` with `Retry-After`. What streams consume is sockets/file descriptors and a little memory each — size the host's `ulimit -n` and your load balancer's connection limits for it, not `max_connections`.
+- **Historical deadlock, for anyone reading older guidance** (issue #188): before issue #152 every stream held a dedicated connection *from the request pool* for its whole lifetime, so the real budget was `worker_pool + (api_instances × (DB_POOL_MAX + concurrent_streams))` — except that streams drew from the same pool rather than adding to it. With the default pool of 10, ten concurrent tabs on one instance took every connection, and that instance's ordinary queries then waited for a free connection forever. If you run a release that predates #152, keep concurrent streams per instance strictly below `DB_POOL_MAX`, or the instance deadlocks.
+
+Worked example, including streams: 3 API instances with `DB_POOL_MAX=10` and `STREAM_MAX_CONNECTIONS=100`, plus a worker pool of 5, at peak with every instance holding 100 open streams:
+
+| | Postgres connections | Sockets |
+|---|---|---|
+| Worker | 5 | — |
+| Request pools | 3 × 10 = 30 | — |
+| Stream listeners | 3 × 1 = 3 | — |
+| SSE clients | 0 | 3 × 100 = 300 |
+| **Total** | **38** of `max_connections` | 300 open streams (plus ordinary request sockets) |
+
+Doubling `STREAM_MAX_CONNECTIONS` to 200 leaves the Postgres column at 38 and doubles only the socket column.
 
 ### Multi-instance API state and PgBouncer
 
@@ -377,7 +401,8 @@ Migrations run automatically on boot, so starting the previous image does **not*
 | `0012_status_check_constraints` | **breaking** — adds `CHECK`s | A release that predates it can no longer write a status outside the set; constraints stay. |
 | `0017_approved_pending_disbursement_status` | **breaking** — widens the status `CHECK` | Rows may hold `approved_pending_disbursement`, which a release predating it does not handle. Reindex is not enough if it has already folded such rows; roll forward. |
 | `0022_failed_events_uniqueness` | **breaking** — `UNIQUE(event_id)` | A release predating it inserts into `failed_events` without `ON CONFLICT`, so a repeat failure of the same event errors on the quarantine path. |
-| all others (`0002`–`0010`, `0013`, `0015`, `0016`, `0018`–`0021`, `0023`) | backward-compatible | Additive columns/tables/indexes; safe to roll back across. |
+| `0024_auth_nonces_rekey` | **breaking** — rekeys `auth_nonces` on `nonce` | A release predating it assumes one row per address; outstanding challenges are the only data at stake, so rolling forward is the fix. |
+| all others (`0002`–`0010`, `0013`, `0015`, `0016`, `0018`–`0021`, `0023`, `0025`) | backward-compatible | Additive columns/tables/indexes; safe to roll back across. |
 
 Versions `0011` and `0014` are unused (gaps are allowed; see the loader in `src/db/migrate.ts`).
 

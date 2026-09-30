@@ -255,7 +255,7 @@ Base path: `/api`.
 **Events & History:**
 - `GET /api/events` — Raw event feed (optional filters: `?symbol=`, `?contract=`, `?before=`, `?after=`, `?order=`)
 - `GET /api/interest` — Interest distribution history
-- `GET /api/documents?kind=&proposal_id=` — Proposal document attachment history
+- `GET /api/documents` — Document attachment history, newest ledger first. All filters optional and combinable: `?kind=loan|treasury`, `?proposal_id=` (requires `kind` — loan and treasury ids collide), `?caller=<G… address>` (a member's attachments), plus `?before=<ledger>` and `?limit=`
 
 **Admin:**
 - `GET /api/admin/log` — Admin/governance audit trail
@@ -295,18 +295,43 @@ Browsers implementing `EventSource` remember the last `id:` they saw and resend 
 
 ### Errors
 
-Every error response — a deliberate `4xx` from a route, a failed request body, or anything thrown while handling the request — uses one shape:
+Every error response — a deliberate `4xx` from a route, a failed request body, a rate-limited request, or anything thrown while handling the request — carries at least these fields:
 
 ```json
-{ "error": "loan not found", "correlationId": "b1f2c3d4-..." }
+{ "error": "loan not found", "code": "NOT_FOUND", "correlationId": "b1f2c3d4-..." }
 ```
 
+- **`code`** is a stable, machine-readable cause from the table below. **Branch on `code`, never on `error`** — the text may be reworded at any time.
 - **`error`** is a short, safe, human-readable string. It never contains a stack trace, SQL, or raw database driver text. Deliberate `4xx` messages (`invalid loan id`, `address query param is required`, …) are passed through unchanged; every `5xx` is a generic string (`internal server error`) with the real cause written only to the server log.
 - **`correlationId`** is the request id. It is also returned in the `x-correlation-id` response header (on success and failure alike) and printed as `reqId` on the matching server-side log line, so a user-reported failure can be traced to its log entry.
 
-Postgres failures are mapped to a sensible status rather than an opaque `500`: a unique violation → `409`, a check violation or missing required value → `422`, and a connection failure → `503`. The driver's message (which would name columns, constraints and types) is logged, never returned.
+Postgres failures are mapped to a sensible status rather than an opaque `500`, and the driver's message (which would name columns, constraints and types) is logged, never returned.
 
-> `429` responses from the rate limiter (`@fastify/rate-limit`) keep that plugin's own body shape (`{ statusCode, error, message }`) and are the one exception to the envelope above.
+| `code` | Status | Meaning |
+|---|---|---|
+| `BAD_REQUEST` | `400` | A route rejected the request's parameters (bad id, cursor, limit, address, …). |
+| `VALIDATION_FAILED` | `400` | The request failed schema validation; `error` names the offending field. |
+| `UNAUTHORIZED` | `401` | Authentication is missing or invalid. |
+| `FORBIDDEN` | `403` | Authenticated, but not allowed to act on this resource. |
+| `NOT_FOUND` | `404` | The route exists but the requested entity does not. |
+| `ROUTE_NOT_FOUND` | `404` | No such route. |
+| `REQUEST_TIMEOUT` | `408` | The client did not send a complete request in time (`HTTP_REQUEST_TIMEOUT_MS`). |
+| `PAYLOAD_TOO_LARGE` | `413` | The request body exceeds `HTTP_BODY_LIMIT_BYTES`. |
+| `RATE_LIMITED` | `429` | Rate limit exceeded; honour `Retry-After`. |
+| `CLIENT_ERROR` | other `4xx` | Any other client error. |
+| `RESOURCE_ALREADY_EXISTS` | `409` | Postgres unique violation. |
+| `RELATED_DATA_CONFLICT` | `409` | Postgres foreign-key violation. |
+| `CONSTRAINT_VIOLATION` | `422` | Postgres check violation. |
+| `MISSING_REQUIRED_VALUE` | `422` | Postgres not-null violation. |
+| `DATABASE_UNAVAILABLE` | `503` | The database is unreachable or shutting down; safe to retry. |
+| `SERVICE_UNAVAILABLE` | `503` | The server shed the request (e.g. `/stats` or `/stream` at capacity); retry after `Retry-After`. |
+| `INTERNAL_ERROR` | `5xx` | Anything else. |
+
+Codes are **append-only** (`ERROR_CODES` in [`src/api/errors.ts`](src/api/errors.ts)): a code is never renamed, removed or repurposed, only added. Unknown codes should be treated by clients like the generic code for their status.
+
+> `/ready`'s `503` is a probe status (`{ status, reason, … }`), not an error, and keeps that shape.
+
+> `429` responses from the rate limiter (`@fastify/rate-limit`) keep that plugin's own fields (`statusCode`, `error`, `message`) and additionally carry `code` and `correlationId`.
 
 ### Caching
 
