@@ -33,7 +33,7 @@ export class FieldValidationError extends Error {
   }
 }
 
-function requireAddr(ev: DecodedEvent, field: string): string {
+export function requireAddr(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   if (typeof v !== 'string' || v === '') {
     throw new FieldValidationError(ev, field, `must be a non-empty address string, got ${JSON.stringify(v)}`)
@@ -41,19 +41,29 @@ function requireAddr(ev: DecodedEvent, field: string): string {
   return v
 }
 
-function requireId(ev: DecodedEvent, field: string): number {
+export function requireId(ev: DecodedEvent, field: string): number {
   const v = ev.fields[field]
-  const n = Number(v)
-  if (v == null || !Number.isFinite(n) || !Number.isInteger(n)) {
+  // Gate on the value's *type* before coercing, not only on the coerced
+  // result. `Number()` accepts booleans and arrays, so the old
+  // `Number.isInteger(Number(v))` check silently turned `true` into id 1,
+  // `[]` into id 0 and `[5]` into id 5 — the same "this event didn't decode,
+  // write something plausible anyway" failure issue #42 is about, one level
+  // down. Contract ids are u32 and decode to a JS number; a plain
+  // decimal-integer string is also accepted because `toJsonSafe` stringifies
+  // any bigint that reaches it (events.ts).
+  const isIntLike =
+    (typeof v === 'number' && Number.isInteger(v)) ||
+    (typeof v === 'string' && /^\d+$/.test(v))
+  if (!isIntLike) {
     throw new FieldValidationError(ev, field, `must be a finite integer id, got ${JSON.stringify(v)}`)
   }
-  return n
+  return Number(v)
 }
 
 /** i128 amounts arrive as decimal-integer strings (bigints are stringified
  *  upstream in toJsonSafe) or, for small values, as a JS number. Never
  *  negative — every amount field here is a magnitude, not a signed delta. */
-function requireAmount(ev: DecodedEvent, field: string): string {
+export function requireAmount(ev: DecodedEvent, field: string): string {
   const v = ev.fields[field]
   const s = typeof v === 'number' && Number.isFinite(v) ? String(v) : v
   if (typeof s !== 'string' || !/^\d+$/.test(s)) {
@@ -62,7 +72,7 @@ function requireAmount(ev: DecodedEvent, field: string): string {
   return s
 }
 
-function requireBool(ev: DecodedEvent, field: string): boolean {
+export function requireBool(ev: DecodedEvent, field: string): boolean {
   const v = ev.fields[field]
   if (typeof v !== 'boolean') {
     throw new FieldValidationError(ev, field, `must be a boolean, got ${JSON.stringify(v)}`)
@@ -85,7 +95,7 @@ function normalizeProposalKind(v: unknown): 'loan' | 'treasury' | null {
   return lower === 'loan' || lower === 'treasury' ? lower : null
 }
 
-function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
+export function requireProposalKind(ev: DecodedEvent, field: string): 'loan' | 'treasury' {
   const kind = normalizeProposalKind(ev.fields[field])
   if (kind === null) {
     throw new FieldValidationError(ev, field, `must be a ProposalKind ("Loan"/"Treasury"), got ${JSON.stringify(ev.fields[field])}`)
